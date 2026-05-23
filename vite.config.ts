@@ -49,5 +49,8 @@ function pdfJsAssets(): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig({
+  optimizeDeps: {
+    exclude: ['mupdf'],
+  },
   plugins: [react(), pdfJsAssets()],
 })

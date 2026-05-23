@@ -3,11 +3,14 @@ import type {
   EditOperation,
   PageOperation,
   ProjectBundle,
+  ProjectDocumentSession,
   ProjectManifest,
   SourceDocument,
 } from '../types'
 
 interface ProjectJson {
+  activeSourceId?: string | null
+  documentSessions?: Record<string, ProjectJsonSession>
   manifest: ProjectManifest
   editOperations: EditOperation[]
   editSnapshots?: Record<string, string>
@@ -16,16 +19,27 @@ interface ProjectJson {
   pdfPath: string
 }
 
+interface ProjectJsonSession {
+  editOperations: EditOperation[]
+  editSnapshots?: Record<string, string>
+  pageOperations: PageOperation[]
+  currentPage?: number
+  extractRange?: string
+}
+
 const CURRENT_APP_VERSION = '0.1.0'
 
 export async function exportProjectPackage(bundle: ProjectBundle): Promise<Blob> {
   const zip = new JSZip()
   const editSnapshots: Record<string, string> = {}
+  const documentSessions: Record<string, ProjectJsonSession> = {}
   const projectJson: ProjectJson = {
+    activeSourceId: bundle.activeSourceId ?? null,
     manifest: bundle.manifest,
     editOperations: bundle.editOperations,
     editSnapshots,
     pageOperations: bundle.pageOperations,
+    documentSessions,
     sourceDocuments: bundle.sourceDocuments.map((source, index) => {
       const dataPath = `sources/${index + 1}-${safeName(source.fileName)}`
       zip.file(dataPath, source.data)
@@ -38,6 +52,22 @@ export async function exportProjectPackage(bundle: ProjectBundle): Promise<Blob>
     const dataPath = `snapshots/${safeName(operationId)}.pdf`
     zip.file(dataPath, snapshot)
     editSnapshots[operationId] = dataPath
+  }
+
+  for (const [sourceId, session] of Object.entries(bundle.documentSessions ?? {})) {
+    const sessionSnapshots: Record<string, string> = {}
+    documentSessions[sourceId] = {
+      editOperations: session.editOperations,
+      editSnapshots: sessionSnapshots,
+      pageOperations: session.pageOperations,
+      currentPage: session.currentPage,
+      extractRange: session.extractRange,
+    }
+    for (const [operationId, snapshot] of Object.entries(session.editSnapshots ?? {})) {
+      const dataPath = `sessions/${safeName(sourceId)}/snapshots/${safeName(operationId)}.pdf`
+      zip.file(dataPath, snapshot)
+      sessionSnapshots[operationId] = dataPath
+    }
   }
 
   zip.file(projectJson.pdfPath, bundle.pdfData)
@@ -82,10 +112,27 @@ export async function importProjectPackage(file: File): Promise<ProjectBundle> {
     const snapshotFile = zip.file(dataPath)
     if (snapshotFile) editSnapshots[operationId] = await snapshotFile.async('arraybuffer')
   }
+  const documentSessions: Record<string, ProjectDocumentSession> = {}
+  for (const [sourceId, session] of Object.entries(projectJson.documentSessions ?? {})) {
+    const sessionSnapshots: Record<string, ArrayBuffer> = {}
+    for (const [operationId, dataPath] of Object.entries(session.editSnapshots ?? {})) {
+      const snapshotFile = zip.file(dataPath)
+      if (snapshotFile) sessionSnapshots[operationId] = await snapshotFile.async('arraybuffer')
+    }
+    documentSessions[sourceId] = {
+      editOperations: normalizeEditOperations(session.editOperations ?? []),
+      editSnapshots: sessionSnapshots,
+      pageOperations: session.pageOperations ?? [],
+      currentPage: session.currentPage ?? 1,
+      extractRange: session.extractRange || `1-${manifest.pageCount}`,
+    }
+  }
   return {
     manifest,
     pdfData,
     sourceDocuments,
+    activeSourceId: projectJson.activeSourceId ?? sourceDocuments[0]?.id ?? null,
+    documentSessions,
     editOperations: normalizeEditOperations(projectJson.editOperations ?? []),
     editSnapshots,
     pageOperations: projectJson.pageOperations ?? [],

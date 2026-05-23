@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, PointerEvent, RefObject } from 'react'
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject } from 'react'
 import {
   ChevronDown,
   ChevronUp,
@@ -50,6 +50,7 @@ import type {
   OverlayTextStyle,
   PageOperation,
   ProjectBundle,
+  ProjectDocumentSession,
   ProjectManifest,
   RecentProject,
   SourceDocument,
@@ -92,13 +93,8 @@ interface UndoSnapshot {
   createdAt: string
 }
 
-interface DocumentSessionState {
-  editOperations: EditOperation[]
-  editSnapshots: Record<string, ArrayBuffer>
-  pageOperations: PageOperation[]
+interface DocumentSessionState extends ProjectDocumentSession {
   undoStack: UndoSnapshot[]
-  currentPage: number
-  extractRange: string
 }
 
 interface ZoomAnchor {
@@ -114,11 +110,23 @@ interface BrowserTextSelection {
   occurrence: TextOccurrence
 }
 
+interface PageRenderMetrics {
+  width: number
+  height: number
+}
+
 const APP_VERSION = '0.1.0'
+const AUTO_SAVE_MAX_SNAPSHOT_COUNT = 5
+const AUTO_SAVE_MAX_SNAPSHOT_BYTES = 80 * 1024 * 1024
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 4
 const ZOOM_STEP_FACTOR = 1.12
 const DEFAULT_RENDER_ZOOM = 1
+const PAGE_RENDER_MARGIN = 2
+const DEFAULT_PAGE_METRICS: PageRenderMetrics = {
+  width: Math.floor(595.28 * 1.35 * DEFAULT_RENDER_ZOOM),
+  height: Math.floor(841.89 * 1.35 * DEFAULT_RENDER_ZOOM),
+}
 const DEFAULT_OVERLAY_STYLE: OverlayTextStyle = {
   backgroundColor: '#ffffff',
   textColor: '#111111',
@@ -145,6 +153,60 @@ function copyEditSnapshots(snapshots: Record<string, ArrayBuffer>): Record<strin
   )
 }
 
+function toProjectDocumentSession(session: DocumentSessionState): ProjectDocumentSession {
+  return {
+    editOperations: session.editOperations.map((operation) => ({ ...operation })),
+    editSnapshots: copyEditSnapshots(session.editSnapshots),
+    pageOperations: session.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
+    currentPage: session.currentPage,
+    extractRange: session.extractRange,
+  }
+}
+
+function toDocumentSessionState(session: ProjectDocumentSession): DocumentSessionState {
+  return {
+    editOperations: session.editOperations.map((operation) => ({ ...operation })),
+    editSnapshots: copyEditSnapshots(session.editSnapshots ?? {}),
+    pageOperations: session.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
+    currentPage: session.currentPage,
+    extractRange: session.extractRange,
+    undoStack: [],
+  }
+}
+
+function trimEditSnapshotsForAutoSave(
+  operations: EditOperation[],
+  snapshots: Record<string, ArrayBuffer>,
+): Record<string, ArrayBuffer> {
+  const trimmed: Record<string, ArrayBuffer> = {}
+  let totalBytes = 0
+  let count = 0
+  for (const operation of operations) {
+    const snapshot = snapshots[operation.id]
+    if (!snapshot) continue
+    if (count >= AUTO_SAVE_MAX_SNAPSHOT_COUNT) break
+    if (totalBytes + snapshot.byteLength > AUTO_SAVE_MAX_SNAPSHOT_BYTES) continue
+    trimmed[operation.id] = snapshot
+    totalBytes += snapshot.byteLength
+    count += 1
+  }
+  return trimmed
+}
+
+function trimProjectSessionsForAutoSave(
+  sessions: Record<string, ProjectDocumentSession>,
+): Record<string, ProjectDocumentSession> {
+  return Object.fromEntries(
+    Object.entries(sessions).map(([sourceId, session]) => [
+      sourceId,
+      {
+        ...session,
+        editSnapshots: trimEditSnapshotsForAutoSave(session.editOperations, session.editSnapshots),
+      },
+    ]),
+  )
+}
+
 function isEditableShortcutTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false
   return Boolean(target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]'))
@@ -166,6 +228,10 @@ function unionTextRects(rects: TextOccurrenceRect[]): TextOccurrenceRect {
 function pageSequence(start: number, end: number): number[] {
   if (end < start) return []
   return Array.from({ length: end - start + 1 }, (_, index) => start + index)
+}
+
+function shouldRenderPage(pageNumber: number, currentPage: number): boolean {
+  return Math.abs(pageNumber - currentPage) <= PAGE_RENDER_MARGIN
 }
 
 function normalizeReloadPages(target: PdfReloadTarget, pageCount: number): number[] {
@@ -288,11 +354,15 @@ function App() {
   const mergeInputRef = useRef<HTMLInputElement>(null)
   const projectInputRef = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const pageJumpInputRef = useRef<HTMLInputElement>(null)
   const documentScrollRef = useRef<HTMLDivElement>(null)
   const pdfReloadTargetRef = useRef<PdfReloadTarget>('all')
   const inspectorResizeRef = useRef<{ max: number; right: number } | null>(null)
   const activeSourceIdRef = useRef<string | null>(null)
+  const documentTabRefs = useRef(new Map<string, HTMLDivElement>())
   const documentSessionsRef = useRef<Record<string, DocumentSessionState>>({})
+  const pdfDocRef = useRef<PDFDocumentProxy | null>(null)
+  const searchTextCacheRef = useRef(new Map<number, string>())
   const zoomRef = useRef(zoom)
   const currentPageRef = useRef(currentPage)
   const pendingZoomAnchorRef = useRef<ZoomAnchor | null>(null)
@@ -310,6 +380,14 @@ function App() {
   useEffect(() => {
     currentPageRef.current = currentPage
   }, [currentPage])
+
+  useEffect(() => {
+    pdfDocRef.current = pdfDoc
+  }, [pdfDoc])
+
+  useEffect(() => () => {
+    if (pdfDocRef.current) void pdfDocRef.current.destroy()
+  }, [])
 
   useLayoutEffect(() => {
     const stage = documentScrollRef.current
@@ -355,15 +433,30 @@ function App() {
     return () => stage.removeEventListener('wheel', handleTrackpadZoom, { capture: true })
   }, [pdfData, sourceDocuments.length])
 
+  useLayoutEffect(() => {
+    if (!activeSourceId) return
+    documentTabRefs.current.get(activeSourceId)?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+    })
+  }, [activeSourceId, sourceDocuments.length])
+
   useEffect(() => {
     if (!pdfData) return
     const reloadTarget = pdfReloadTargetRef.current
+    searchTextCacheRef.current.clear()
 
     let cancelled = false
     loadPdf(pdfData)
       .then((doc) => {
-        if (cancelled) return
-        setPdfDoc(doc)
+        if (cancelled) {
+          void doc.destroy()
+          return
+        }
+        setPdfDoc((previous) => {
+          if (previous && previous !== doc) void previous.destroy()
+          return doc
+        })
         setCurrentPage((page) => Math.min(Math.max(page, 1), doc.numPages))
         if (reloadTarget === 'all') {
           setPageRenderVersions({})
@@ -381,7 +474,10 @@ function App() {
         }
       })
       .catch((error: unknown) => {
-        setPdfDoc(null)
+        setPdfDoc((previous) => {
+          if (previous) void previous.destroy()
+          return null
+        })
         setStatus(error instanceof Error ? error.message : 'PDF를 열 수 없습니다.')
       })
 
@@ -389,31 +485,6 @@ function App() {
       cancelled = true
     }
   }, [pdfData])
-
-  useEffect(() => {
-    if (!manifest || !pdfData) return
-    const updatedManifest = {
-      ...manifest,
-      updatedAt: new Date().toISOString(),
-      pageCount: pdfDoc?.numPages ?? manifest.pageCount,
-    }
-    const bundle: ProjectBundle = {
-      manifest: updatedManifest,
-      pdfData,
-      sourceDocuments,
-      editOperations,
-      editSnapshots,
-      pageOperations,
-    }
-    const timer = window.setTimeout(() => {
-      saveProject(bundle)
-        .then(() => listRecentProjects())
-        .then(setRecentProjects)
-        .catch(() => setStatus('자동저장에 실패했습니다.'))
-    }, 800)
-
-    return () => window.clearTimeout(timer)
-  }, [editOperations, editSnapshots, manifest, pageOperations, pdfData, pdfDoc?.numPages, sourceDocuments])
 
   useEffect(() => {
     if (!pdfDoc || !searchText.trim()) {
@@ -430,15 +501,25 @@ function App() {
       setSearchState('검색 중')
       void (async () => {
         const results: SearchResult[] = []
+        let failedPages = 0
         for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
-          const page = await pdfDoc.getPage(pageNumber)
-          const textContent = await page.getTextContent()
-          const pageText = textContent.items
-            .filter((item) => 'str' in item && typeof item.str === 'string')
-            .map((item) => (item as { str: string }).str)
-            .join(' ')
-            .replace(/\s+/g, ' ')
-            .trim()
+          let pageText = searchTextCacheRef.current.get(pageNumber)
+          if (pageText === undefined) {
+            try {
+              const page = await pdfDoc.getPage(pageNumber)
+              const textContent = await page.getTextContent()
+              pageText = textContent.items
+                .filter((item) => 'str' in item && typeof item.str === 'string')
+                .map((item) => (item as { str: string }).str)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+              searchTextCacheRef.current.set(pageNumber, pageText)
+            } catch {
+              failedPages += 1
+              continue
+            }
+          }
           const lowerText = pageText.toLocaleLowerCase('ko-KR')
           const matchStart = lowerText.indexOf(query)
           if (matchStart === -1) continue
@@ -451,7 +532,9 @@ function App() {
         }
         if (cancelled) return
         setSearchResults(results)
-        setSearchState(results.length > 0 ? `${results.length}개 결과` : '검색 결과가 없습니다.')
+        setSearchState(results.length > 0
+          ? failedPages > 0 ? `${results.length}개 결과 · ${failedPages}쪽 제외` : `${results.length}개 결과`
+          : failedPages > 0 ? `검색 결과 없음 · ${failedPages}쪽 제외` : '검색 결과가 없습니다.')
       })().catch(() => {
         if (!cancelled) {
           setSearchResults([])
@@ -532,6 +615,24 @@ function App() {
     return activeSourceIdRef.current ?? '__current-document__'
   }
 
+  function syncCurrentPdfDataIntoSources(sources: SourceDocument[]): SourceDocument[] {
+    const sourceId = activeSourceIdRef.current
+    if (!sourceId || !pdfData) return sources
+    const pageCount = pdfDoc?.numPages
+    let didSync = false
+    const nextSources = sources.map((source) => {
+      if (source.id !== sourceId) return source
+      didSync = true
+      return {
+        ...source,
+        data: pdfData.slice(0),
+        pageCount: pageCount ?? source.pageCount,
+        rangeText: source.rangeText || `1-${pageCount ?? source.pageCount}`,
+      }
+    })
+    return didSync ? nextSources : sources
+  }
+
   function captureDocumentSession(): DocumentSessionState {
     return {
       editOperations: editOperations.map((operation) => ({ ...operation })),
@@ -551,8 +652,64 @@ function App() {
     }
   }
 
-  function stashCurrentDocumentSession(): void {
+  function captureProjectDocumentSessions(): Record<string, ProjectDocumentSession> {
+    const currentSession: ProjectDocumentSession = {
+      editOperations: editOperations.map((operation) => ({ ...operation })),
+      editSnapshots: copyEditSnapshots(editSnapshots),
+      pageOperations: pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
+      currentPage,
+      extractRange,
+    }
+    return {
+      ...Object.fromEntries(
+        Object.entries(documentSessionsRef.current).map(([sourceId, session]) => [
+          sourceId,
+          toProjectDocumentSession(session),
+        ]),
+      ),
+      [currentDocumentSessionKey()]: currentSession,
+    }
+  }
+
+  function createProjectBundle(updatedManifest: ProjectManifest, autoSave = false): ProjectBundle {
+    const sessions = captureProjectDocumentSessions()
+    const sessionPayload = autoSave ? trimProjectSessionsForAutoSave(sessions) : sessions
+    return {
+      manifest: updatedManifest,
+      pdfData: pdfData ? pdfData.slice(0) : new ArrayBuffer(0),
+      sourceDocuments: syncCurrentPdfDataIntoSources(sourceDocuments),
+      activeSourceId: activeSourceIdRef.current,
+      documentSessions: sessionPayload,
+      editOperations: editOperations.map((operation) => ({ ...operation })),
+      editSnapshots: autoSave ? trimEditSnapshotsForAutoSave(editOperations, editSnapshots) : copyEditSnapshots(editSnapshots),
+      pageOperations: pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
+    }
+  }
+
+  useEffect(() => {
+    if (!manifest || !pdfData) return
+    const updatedManifest = {
+      ...manifest,
+      updatedAt: new Date().toISOString(),
+      pageCount: pdfDoc?.numPages ?? manifest.pageCount,
+    }
+    const bundle = createProjectBundle(updatedManifest, true)
+    const timer = window.setTimeout(() => {
+      saveProject(bundle)
+        .then(() => listRecentProjects())
+        .then(setRecentProjects)
+        .catch(() => setStatus('자동저장에 실패했습니다.'))
+    }, 1500)
+
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- createProjectBundle only reads the state values listed below.
+  }, [activeSourceId, currentPage, editOperations, editSnapshots, extractRange, manifest, pageOperations, pdfData, pdfDoc?.numPages, sourceDocuments])
+
+  function stashCurrentDocumentSession(): SourceDocument[] {
     documentSessionsRef.current[currentDocumentSessionKey()] = captureDocumentSession()
+    const nextSources = syncCurrentPdfDataIntoSources(sourceDocuments)
+    if (nextSources !== sourceDocuments) setSourceDocuments(nextSources)
+    return nextSources
   }
 
   function applyDocumentSession(session: DocumentSessionState | undefined, pageCount: number): void {
@@ -655,7 +812,10 @@ function App() {
     pdfReloadTargetRef.current = 'all'
     setPdfData(snapshot.pdfData ? snapshot.pdfData.slice(0) : null)
     if (!snapshot.pdfData) {
-      setPdfDoc(null)
+      setPdfDoc((previous) => {
+        if (previous) void previous.destroy()
+        return null
+      })
       setDocumentRenderVersion((version) => version + 1)
     }
     const restoredSources = copySourceDocuments(snapshot.sourceDocuments)
@@ -743,6 +903,32 @@ function App() {
     window.addEventListener('keydown', handleUndoShortcut)
     return () => window.removeEventListener('keydown', handleUndoShortcut)
   }, [deleteBrowserSelectedText, manualOverlayEnabled, selectedOccurrence, textSelectionEnabled, undoLastAction])
+
+  useEffect(() => {
+    if (!textSelectionEnabled) return undefined
+
+    function syncBrowserTextSelection(): void {
+      window.setTimeout(() => {
+        const selectedText = browserTextSelectionToOccurrence()
+        if (!selectedText) return
+        setInspectorTab('text')
+        activatePage(selectedText.pageNumber, false)
+        setTextOccurrences([selectedText.occurrence])
+        setSelectedOccurrenceId(selectedText.occurrence.id)
+        setManualOverlayEnabled(false)
+        setManualOverlayRect(null)
+        setEditOriginal(selectedText.occurrence.snippet)
+        setStatus(`드래그로 선택한 텍스트를 인식했습니다: ${selectedText.occurrence.snippet}`)
+      }, 0)
+    }
+
+    window.addEventListener('pointerup', syncBrowserTextSelection)
+    window.addEventListener('keyup', syncBrowserTextSelection)
+    return () => {
+      window.removeEventListener('pointerup', syncBrowserTextSelection)
+      window.removeEventListener('keyup', syncBrowserTextSelection)
+    }
+  }, [activatePage, textSelectionEnabled])
 
   async function openPdfFiles(files: FileList | null): Promise<void> {
     if (!files?.length) return
@@ -844,7 +1030,7 @@ function App() {
   }
 
   function removeSource(id: string): void {
-    const sources = sourceDocuments
+    const sources = stashCurrentDocumentSession()
     const index = sources.findIndex((source) => source.id === id)
     if (index === -1) return
     const remaining = sources.filter((source) => source.id !== id)
@@ -873,7 +1059,10 @@ function App() {
         // 마지막 탭까지 닫은 경우
         setActiveSource(null)
         setPdfData(null)
-        setPdfDoc(null)
+        setPdfDoc((previous) => {
+          if (previous) void previous.destroy()
+          return null
+        })
         setManifest(null)
         setEditOperations([])
         setEditSnapshots({})
@@ -919,9 +1108,15 @@ function App() {
     }))
     resetTransientSelection()
     setMode('editor')
-    setInspectorTab('pages')
+    if (mode === 'merge') setInspectorTab('pages')
     setScrollRequest((request) => ({ id: (request?.id ?? 0) + 1, page: 1 }))
     setStatus(`${source.fileName} 탭으로 이동했습니다.`)
+  }
+
+  function handleDocumentTabKeyDown(event: ReactKeyboardEvent<HTMLDivElement>, sourceId: string): void {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    switchSourceDocument(sourceId)
   }
 
   async function runMerge(): Promise<void> {
@@ -1095,7 +1290,7 @@ function App() {
       const nextPageCount = pdfDoc.numPages + new Set(pages).size
       const operation: PageOperation = {
         id: crypto.randomUUID(),
-        type: 'merge',
+        type: 'duplicate',
         sourceId: 'current-document',
         pages,
         createdAt: new Date().toISOString(),
@@ -1460,17 +1655,57 @@ function App() {
       setStatus('저장할 프로젝트가 없습니다.')
       return
     }
-    const bundle: ProjectBundle = {
-      manifest: { ...manifest, updatedAt: new Date().toISOString() },
-      pdfData,
-      sourceDocuments,
-      editOperations,
-      editSnapshots,
-      pageOperations,
-    }
+    const bundle = createProjectBundle({ ...manifest, updatedAt: new Date().toISOString() })
     const blob = await exportProjectPackage(bundle)
     downloadBytes(await blob.arrayBuffer(), `${manifest.name}.pdfproj`, 'application/x-pdfproj')
     setStatus('.pdfproj 프로젝트 파일을 내보냈습니다.')
+  }
+
+  function restoreProjectBundle(bundle: ProjectBundle, statusMessage: string): void {
+    const activeSourceId = bundle.activeSourceId && bundle.sourceDocuments.some((source) => source.id === bundle.activeSourceId)
+      ? bundle.activeSourceId
+      : bundle.sourceDocuments[0]?.id ?? null
+    const sourceDocumentsWithCurrentPdf = activeSourceId
+      ? bundle.sourceDocuments.map((source) => (
+          source.id === activeSourceId
+            ? {
+                ...source,
+                data: bundle.pdfData.slice(0),
+                pageCount: bundle.manifest.pageCount || source.pageCount,
+                rangeText: source.rangeText || `1-${bundle.manifest.pageCount || source.pageCount}`,
+              }
+            : source
+        ))
+      : bundle.sourceDocuments
+    const sessions = Object.fromEntries(
+      Object.entries(bundle.documentSessions ?? {}).map(([sourceId, session]) => [
+        sourceId,
+        toDocumentSessionState(session),
+      ]),
+    )
+    const activeSession = activeSourceId ? sessions[activeSourceId] : undefined
+
+    documentSessionsRef.current = sessions
+    setActiveSource(activeSourceId)
+    setManifest(bundle.manifest)
+    replacePdfData(bundle.pdfData, 'all', { syncActiveSource: false })
+    setSourceDocuments(sourceDocumentsWithCurrentPdf)
+    setEditOperations(activeSession?.editOperations ?? bundle.editOperations)
+    setEditSnapshots(activeSession?.editSnapshots ?? bundle.editSnapshots ?? {})
+    setPageOperations(activeSession?.pageOperations ?? bundle.pageOperations)
+    setCurrentPage(activeSession?.currentPage ?? 1)
+    setExtractRange(activeSession?.extractRange ?? `1-${bundle.manifest.pageCount}`)
+    setUndoStack([])
+    setTextOccurrences([])
+    setSelectedOccurrenceId(undefined)
+    setManualOverlayEnabled(false)
+    setTextSelectionEnabled(false)
+    setManualOverlayRect(null)
+    setOverlayStyle(DEFAULT_OVERLAY_STYLE)
+    setShowHome(false)
+    setMode('editor')
+    setInspectorTab('pages')
+    setStatus(statusMessage)
   }
 
   async function importProject(files: FileList | null): Promise<void> {
@@ -1478,26 +1713,7 @@ function App() {
     if (!file) return
     try {
       const bundle = await importProjectPackage(file)
-      documentSessionsRef.current = {}
-      setActiveSource(bundle.sourceDocuments[0]?.id ?? null)
-      setManifest(bundle.manifest)
-      replacePdfData(bundle.pdfData, 'all', { syncActiveSource: false })
-      setSourceDocuments(bundle.sourceDocuments)
-      setEditOperations(bundle.editOperations)
-      setEditSnapshots(bundle.editSnapshots ?? {})
-      setPageOperations(bundle.pageOperations)
-      setCurrentPage(1)
-      setUndoStack([])
-      setTextOccurrences([])
-      setSelectedOccurrenceId(undefined)
-      setManualOverlayEnabled(false)
-      setTextSelectionEnabled(false)
-      setManualOverlayRect(null)
-      setOverlayStyle(DEFAULT_OVERLAY_STYLE)
-      setShowHome(false)
-      setMode('editor')
-      setInspectorTab('pages')
-      setStatus(`${bundle.manifest.name} 프로젝트를 불러왔습니다.`)
+      restoreProjectBundle(bundle, `${bundle.manifest.name} 프로젝트를 불러왔습니다.`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '프로젝트 불러오기에 실패했습니다.')
     } finally {
@@ -1511,32 +1727,25 @@ function App() {
       setStatus('최근 프로젝트를 찾을 수 없습니다.')
       return
     }
-    documentSessionsRef.current = {}
-    setActiveSource(bundle.sourceDocuments[0]?.id ?? null)
-    setManifest(bundle.manifest)
-    replacePdfData(bundle.pdfData, 'all', { syncActiveSource: false })
-    setSourceDocuments(bundle.sourceDocuments)
-    setEditOperations(bundle.editOperations)
-    setEditSnapshots(bundle.editSnapshots ?? {})
-    setPageOperations(bundle.pageOperations)
-    setCurrentPage(1)
-    setUndoStack([])
-    setTextOccurrences([])
-    setSelectedOccurrenceId(undefined)
-    setManualOverlayEnabled(false)
-    setTextSelectionEnabled(false)
-    setManualOverlayRect(null)
-    setOverlayStyle(DEFAULT_OVERLAY_STYLE)
-    setShowHome(false)
-    setMode('editor')
-    setInspectorTab('pages')
-    setStatus(`${bundle.manifest.name} 작업을 이어갑니다.`)
+    restoreProjectBundle(bundle, `${bundle.manifest.name} 작업을 이어갑니다.`)
   }
 
   async function deleteRecent(id: string): Promise<void> {
     await removeProject(id)
     setRecentProjects(await listRecentProjects())
     setStatus('최근 작업을 삭제했습니다.')
+  }
+
+  function jumpToTypedPage(): void {
+    if (!pdfDoc) return
+    const page = Number(pageJumpInputRef.current?.value ?? currentPage)
+    if (!Number.isInteger(page) || page < 1 || page > pdfDoc.numPages) {
+      setStatus(`1-${pdfDoc.numPages} 사이의 페이지 번호를 입력하세요.`)
+      if (pageJumpInputRef.current) pageJumpInputRef.current.value = String(currentPage)
+      return
+    }
+    activatePage(page, true)
+    setStatus(`${page}쪽으로 이동했습니다.`)
   }
 
   return (
@@ -1592,13 +1801,14 @@ function App() {
             <FileArchive aria-hidden="true" />
             프로젝트
           </button>
-          <button type="button" onClick={() => void exportProject()}>
+          <button type="button" onClick={() => void exportProject()} disabled={!manifest || !pdfData}>
             <Save aria-hidden="true" />
             저장
           </button>
           <button
             type="button"
             onClick={() => pdfData && downloadBytes(pdfData, activeSource?.fileName ?? `${manifest?.name ?? 'document'}.pdf`)}
+            disabled={!pdfData}
           >
             <Download aria-hidden="true" />
             내보내기
@@ -1609,6 +1819,7 @@ function App() {
               ref={searchInputRef}
               value={searchText}
               placeholder="문서 내 검색"
+              disabled={!pdfDoc}
               onFocus={() => setRailTab('recent')}
               onChange={(event) => {
                 setSearchText(event.target.value)
@@ -1620,6 +1831,7 @@ function App() {
           <button
             type="button"
             className="icon-button"
+            disabled={!pdfDoc}
             onClick={() => {
               const currentZoom = zoomRef.current
               const next = clamp(Number((currentZoom / ZOOM_STEP_FACTOR).toFixed(3)), MIN_ZOOM, MAX_ZOOM)
@@ -1647,6 +1859,7 @@ function App() {
           <button
             type="button"
             className="icon-button"
+            disabled={!pdfDoc}
             onClick={() => {
               const currentZoom = zoomRef.current
               const next = clamp(Number((currentZoom * ZOOM_STEP_FACTOR).toFixed(3)), MIN_ZOOM, MAX_ZOOM)
@@ -1673,6 +1886,7 @@ function App() {
           <button
             type="button"
             className={textSelectionEnabled ? 'icon-button active-tool' : 'icon-button'}
+            disabled={!pdfDoc}
             onClick={() => {
               setTextSelectionEnabled((enabled) => !enabled)
               setManualOverlayEnabled(false)
@@ -1799,10 +2013,16 @@ function App() {
                   <div
                     className={source.id === activeSourceId ? 'document-tab active' : 'document-tab'}
                     key={source.id}
+                    ref={(node) => {
+                      if (node) documentTabRefs.current.set(source.id, node)
+                      else documentTabRefs.current.delete(source.id)
+                    }}
                     title={`${source.fileName} · ${source.pageCount}쪽`}
                     role="tab"
                     aria-selected={source.id === activeSourceId}
+                    tabIndex={0}
                     onClick={() => switchSourceDocument(source.id)}
+                    onKeyDown={(event) => handleDocumentTabKeyDown(event, source.id)}
                   >
                     <span className="document-tab-name">{source.fileName}</span>
                     <span className="document-tab-meta" aria-hidden="true">{source.pageCount}쪽</span>
@@ -1987,7 +2207,38 @@ function App() {
 
       <footer className="statusbar">
         <span><ShieldCheck aria-hidden="true" /> {status}</span>
-        <span>{pdfDoc ? `페이지 ${selectedPageSummary} · ${Math.round(zoom * 100)}% · 로컬 처리 중` : 'PDF 없음'}</span>
+        {pdfDoc ? (
+          <form
+            className="page-jump"
+            onSubmit={(event) => {
+              event.preventDefault()
+              jumpToTypedPage()
+            }}
+          >
+            <span className="status-page-summary">페이지 {selectedPageSummary}</span>
+            <label>
+              <span>이동</span>
+              <input
+                aria-label="이동할 페이지"
+                key={currentPage}
+                ref={pageJumpInputRef}
+                defaultValue={String(currentPage)}
+                inputMode="numeric"
+                onBlur={(event) => {
+                  if (!event.currentTarget.value) event.currentTarget.value = String(currentPage)
+                }}
+                onChange={(event) => {
+                  event.currentTarget.value = event.currentTarget.value.replace(/[^\d]/g, '')
+                }}
+              />
+            </label>
+            <span>/ {pdfDoc.numPages}</span>
+            <button type="submit">이동</button>
+            <span>{Math.round(zoom * 100)}% · 로컬 처리 중</span>
+          </form>
+        ) : (
+          <span>PDF 없음</span>
+        )}
       </footer>
     </div>
   )
@@ -2283,6 +2534,17 @@ function PdfCanvas({
   onVisiblePageChange,
 }: PdfCanvasProps) {
   const pageRefs = useRef(new Map<number, HTMLDivElement>())
+  const [pageMetrics, setPageMetrics] = useState<Record<number, PageRenderMetrics>>({})
+
+  const defaultMetrics = pageMetrics[currentPage] ?? pageMetrics[1] ?? DEFAULT_PAGE_METRICS
+
+  const handlePageMetricsChange = useCallback((pageNumber: number, metrics: PageRenderMetrics) => {
+    setPageMetrics((current) => {
+      const previous = current[pageNumber]
+      if (previous && previous.width === metrics.width && previous.height === metrics.height) return current
+      return { ...current, [pageNumber]: metrics }
+    })
+  }, [])
 
   useEffect(() => {
     if (!scrollRequest) return
@@ -2332,22 +2594,32 @@ function PdfCanvas({
             else pageRefs.current.delete(pageNumber)
           }}
         >
-          <PageCanvas
-            active={pageNumber === currentPage}
-            doc={doc}
-            manualOverlayEnabled={manualOverlayEnabled && pageNumber === currentPage}
-            occurrences={pageNumber === currentPage ? occurrences : []}
-            pageNumber={pageNumber}
-            renderVersion={documentRenderVersion + (pageRenderVersions[pageNumber] ?? 0)}
-            searchText={searchText}
-            selectedOccurrenceId={selectedOccurrenceId}
-            textSelectionEnabled={textSelectionEnabled && pageNumber === currentPage}
-            zoom={zoom}
-            onManualRectChange={onManualRectChange}
-            onSelectOccurrence={onSelectOccurrence}
-            onStyleSample={onStyleSample}
-            onTextRectSelect={onTextRectSelect}
-          />
+          {shouldRenderPage(pageNumber, currentPage) ? (
+            <PageCanvas
+              active={pageNumber === currentPage}
+              doc={doc}
+              manualOverlayEnabled={manualOverlayEnabled && pageNumber === currentPage}
+              occurrences={pageNumber === currentPage ? occurrences : []}
+              pageNumber={pageNumber}
+              renderVersion={documentRenderVersion + (pageRenderVersions[pageNumber] ?? 0)}
+              searchText={searchText}
+              selectedOccurrenceId={selectedOccurrenceId}
+              textSelectionEnabled={textSelectionEnabled && pageNumber === currentPage}
+              zoom={zoom}
+              onManualRectChange={onManualRectChange}
+              onMetricsChange={handlePageMetricsChange}
+              onSelectOccurrence={onSelectOccurrence}
+              onStyleSample={onStyleSample}
+              onTextRectSelect={onTextRectSelect}
+            />
+          ) : (
+            <PagePlaceholder
+              active={pageNumber === currentPage}
+              metrics={pageMetrics[pageNumber] ?? defaultMetrics}
+              pageNumber={pageNumber}
+              zoom={zoom}
+            />
+          )}
         </div>
       ))}
     </div>
@@ -2366,9 +2638,37 @@ interface PageCanvasProps {
   textSelectionEnabled: boolean
   zoom: number
   onManualRectChange: (pageNumber: number, rect: TextOccurrenceRect) => void
+  onMetricsChange: (pageNumber: number, metrics: PageRenderMetrics) => void
   onSelectOccurrence: (id: string) => void
   onStyleSample: (style: OverlayTextStyle) => void
   onTextRectSelect: (pageNumber: number, rect: TextOccurrenceRect) => void
+}
+
+function PagePlaceholder({
+  active,
+  metrics,
+  pageNumber,
+  zoom,
+}: {
+  active: boolean
+  metrics: PageRenderMetrics
+  pageNumber: number
+  zoom: number
+}) {
+  const instantScale = zoom / DEFAULT_RENDER_ZOOM
+  return (
+    <div className="canvas-wrap">
+      <div className="page-number-badge">{pageNumber}</div>
+      <div
+        className="page-frame-shell page-placeholder"
+        style={{
+          width: Math.max(1, metrics.width * instantScale),
+          height: Math.max(1, metrics.height * instantScale),
+        }}
+      />
+      {active ? <div className="floating-note">페이지 준비 중</div> : null}
+    </div>
+  )
 }
 
 function PageCanvas({
@@ -2383,6 +2683,7 @@ function PageCanvas({
   textSelectionEnabled,
   zoom,
   onManualRectChange,
+  onMetricsChange,
   onSelectOccurrence,
   onStyleSample,
   onTextRectSelect,
@@ -2450,10 +2751,12 @@ function PageCanvas({
         canvas.height = Math.floor(viewport.height * outputScale)
         canvas.style.width = `${Math.floor(viewport.width)}px`
         canvas.style.height = `${Math.floor(viewport.height)}px`
-        setRenderMetrics({
+        const metrics = {
           width: Math.floor(viewport.width),
           height: Math.floor(viewport.height),
-        })
+        }
+        setRenderMetrics(metrics)
+        onMetricsChange(pageNumber, metrics)
         if (textLayerElement) {
           textLayerElement.replaceChildren()
           textLayerElement.style.width = `${Math.floor(viewport.width)}px`
@@ -2465,19 +2768,35 @@ function PageCanvas({
 
         renderTask = page.render({ canvas, canvasContext: context, viewport })
         await renderTask.promise
+        let selectableTextCount = 0
+        let textExtractionFailed = false
         if (textLayerElement && !cancelled) {
           try {
+            const textContent = await page.getTextContent()
+            selectableTextCount = textContent.items.filter((item) => (
+              'str' in item && typeof item.str === 'string' && item.str.length > 0
+            )).length
             textLayer = new TextLayer({
               container: textLayerElement,
-              textContentSource: await page.getTextContent(),
+              textContentSource: textContent,
               viewport,
             })
             await textLayer.render()
           } catch (error) {
-            if (!cancelled) console.warn('PDF text layer render failed', error)
+            textExtractionFailed = true
+            if (!cancelled) {
+              textLayerElement.replaceChildren()
+              console.warn('PDF text layer render failed', error)
+            }
           }
         }
-        if (!cancelled) setRenderState(searchText ? `"${searchText}" 검색어 표시 준비` : '렌더링 완료')
+        if (!cancelled) {
+          setRenderState(textExtractionFailed
+            ? '텍스트 추출 실패: 브라우저 자산 로딩 문제일 수 있음'
+            : selectableTextCount === 0
+              ? '선택 가능한 텍스트 없음: 이미지형/스캔 PDF일 수 있음'
+              : searchText ? `"${searchText}" 검색어 표시 준비` : '렌더링 완료')
+        }
       })
       .catch((error: unknown) => {
         if (cancelled || (error instanceof Error && error.name === 'RenderingCancelledException')) return
@@ -2490,7 +2809,7 @@ function PageCanvas({
       textLayer?.cancel()
       textLayerElement?.replaceChildren()
     }
-  }, [pageNumber, renderVersion, searchText])
+  }, [onMetricsChange, pageNumber, renderVersion, searchText])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -3031,10 +3350,6 @@ function PageManageInspector({
             <dd>{currentPage}</dd>
           </div>
           <div>
-            <dt>방향</dt>
-            <dd>세로</dd>
-          </div>
-          <div>
             <dt>파일 크기</dt>
             <dd>{(fileSize / 1024 / 1024).toFixed(2)} MB</dd>
           </div>
@@ -3121,14 +3436,6 @@ function MergeInspector({
           </div>
         </dl>
         <div className="option-list">
-          <label>
-            <input type="checkbox" checked readOnly />
-            링크 유지
-          </label>
-          <label>
-            <input type="checkbox" checked readOnly />
-            페이지 레이아웃 유지
-          </label>
           <label>
             <input
               type="checkbox"

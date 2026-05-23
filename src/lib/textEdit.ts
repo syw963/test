@@ -6,21 +6,8 @@ import type { EditMethod, EditOperation, OverlayTextStyle, TextOccurrence, TextO
 
 type MuPdfModule = typeof import('mupdf')
 type PdfObject = InstanceType<MuPdfModule['PDFObject']>
-
-// NotoSansKR 폰트 버퍼를 모듈 레벨에서 캐싱 (최초 1회만 fetch)
-let cachedNotoSansKrBuffer: Promise<ArrayBuffer> | null = null
-function fetchNotoSansKrBuffer(): Promise<ArrayBuffer> {
-  if (!cachedNotoSansKrBuffer) {
-    cachedNotoSansKrBuffer = fetch(notoSansKrUrl).then((response) => {
-      if (!response.ok) throw new Error('한글 폰트를 불러오지 못했습니다. 잠시 후 다시 시도하세요.')
-      return response.arrayBuffer()
-    }).catch((error) => {
-      cachedNotoSansKrBuffer = null  // 실패 시 다음 호출에서 재시도
-      throw error
-    })
-  }
-  return cachedNotoSansKrBuffer
-}
+type MuPdfDocument = InstanceType<MuPdfModule['Document']>
+type MuPdfPage = InstanceType<MuPdfModule['Page']>
 type MuPdfPDFPage = InstanceType<MuPdfModule['PDFPage']>
 type MuPdfQuad = import('mupdf').Quad
 type Quad = number[]
@@ -781,8 +768,38 @@ function toMuPdfQuad(quad: Quad): MuPdfQuad {
 
 function saveMuPdfDocument(pdfDoc: InstanceType<MuPdfModule['PDFDocument']>): ArrayBuffer {
   const saved = pdfDoc.saveToBuffer('garbage=4,compress=yes')
-  const savedBytes = new Uint8Array(saved.asUint8Array())
-  return savedBytes.buffer.slice(savedBytes.byteOffset, savedBytes.byteOffset + savedBytes.byteLength)
+  try {
+    const savedBytes = new Uint8Array(saved.asUint8Array())
+    return savedBytes.buffer.slice(savedBytes.byteOffset, savedBytes.byteOffset + savedBytes.byteLength)
+  } finally {
+    saved.destroy()
+  }
+}
+
+function destroyMuPdfValue(value: { destroy: () => void } | null | undefined): void {
+  try {
+    value?.destroy()
+  } catch {
+    // MuPDF may already have invalidated borrowed objects after a page update.
+  }
+}
+
+function releaseMuPdf(module: MuPdfModule | undefined, ...values: Array<{ destroy: () => void } | null | undefined>): void {
+  for (const value of values) destroyMuPdfValue(value)
+  try {
+    module?.emptyStore()
+    module?.shrinkStore(1)
+  } catch {
+    // Store cleanup is best-effort; the operation result has already been decided.
+  }
+}
+
+function describeMuPdfError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/out of memory|cannot allocate wasm memory|webassembly\.instantiate/i.test(message)) {
+    return '브라우저가 PDF 삭제 엔진용 메모리를 확보하지 못했습니다. 다른 큰 탭을 닫고 새로고침한 뒤 다시 시도하세요.'
+  }
+  return error instanceof Error ? error.message : fallback
 }
 
 export function normalizeRect(rect: TextOccurrenceRect): TextOccurrenceRect {
@@ -826,16 +843,6 @@ function rectContainsCenter(container: TextOccurrenceRect, target: TextOccurrenc
     centerX <= normalized.x + normalized.width &&
     centerY >= normalized.y &&
     centerY <= normalized.y + normalized.height
-}
-
-function padRect(rect: TextOccurrenceRect, padding: number): TextOccurrenceRect {
-  const normalized = normalizeRect(rect)
-  return {
-    x: normalized.x - padding,
-    y: normalized.y - padding,
-    width: normalized.width + padding * 2,
-    height: normalized.height + padding * 2,
-  }
 }
 
 function snippetFor(value: string, matchStart: number, matchLength: number): string {
@@ -938,8 +945,7 @@ export async function listTextOccurrencesInRect(
   pageNumber: number,
   rect: TextOccurrenceRect,
 ): Promise<TextOccurrence[]> {
-  const rawSelectionRect = normalizeRect(rect)
-  const selectionRect = padRect(rawSelectionRect, 2)
+  const selectionRect = normalizeRect(rect)
   const doc = await loadPdf(pdfData)
   try {
     const page = await doc.getPage(pageNumber)
@@ -952,9 +958,8 @@ export async function listTextOccurrencesInRect(
       const textItem = item as PdfTextItem
       const itemRect = rectForPdfTextItem(textItem, viewport.transform)
       const itemArea = Math.max(1, itemRect.width * itemRect.height)
-      const selectionArea = Math.max(1, selectionRect.width * selectionRect.height)
       const overlap = rectIntersectionArea(selectionRect, itemRect)
-      if (overlap / itemArea < 0.12 && overlap / selectionArea < 0.12 && !rectContainsCenter(selectionRect, itemRect)) continue
+      if (overlap / itemArea < 0.18 && !rectContainsCenter(selectionRect, itemRect)) continue
       selectedItems.push({ rect: itemRect, text: textItem.str.trim() })
     }
 
@@ -985,7 +990,7 @@ export async function listTextOccurrencesInRect(
     return [{
       index: 0,
       pageNumber,
-      id: `selection-${pageNumber}-${Math.round(rawSelectionRect.x)}-${Math.round(rawSelectionRect.y)}-${Math.round(rawSelectionRect.width)}-${Math.round(rawSelectionRect.height)}`,
+      id: `selection-${pageNumber}-${Math.round(selectionRect.x)}-${Math.round(selectionRect.y)}-${Math.round(selectionRect.width)}-${Math.round(selectionRect.height)}`,
       source: 'pdfjs',
       snippet: text,
       confidence: 0.82,
@@ -1017,8 +1022,9 @@ async function loadOverlayFont(pdfDoc: PDFDocument, replacementText: string) {
   if (!useEmbeddedFont) return pdfDoc.embedFont(StandardFonts.Helvetica)
 
   pdfDoc.registerFontkit(fontkit)
-  const fontBuffer = await fetchNotoSansKrBuffer()
-  return pdfDoc.embedFont(fontBuffer.slice(0), { subset: false })
+  const response = await fetch(notoSansKrUrl)
+  if (!response.ok) throw new Error('한글 폰트를 불러오지 못했습니다. 잠시 후 다시 시도하세요.')
+  return pdfDoc.embedFont(await response.arrayBuffer(), { subset: false })
 }
 
 export function createManualOccurrence(
@@ -1125,17 +1131,22 @@ export async function listTextOccurrences(
 ): Promise<TextOccurrence[]> {
   if (!text.trim()) return []
   let mupdfOccurrences: TextOccurrence[] = []
+  let mupdf: MuPdfModule | undefined
+  let doc: MuPdfDocument | undefined
+  let page: MuPdfPage | MuPdfPDFPage | undefined
   try {
-    const mupdf = await import('mupdf')
-    const doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
+    mupdf = await import('mupdf')
+    doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
     if (!doc.needsPassword()) {
-      const page = doc.loadPage(pageNumber - 1)
+      page = doc.loadPage(pageNumber - 1)
       mupdfOccurrences = page
         .search(text, 100)
         .map((quads, index) => occurrenceFromQuads(quads, index, pageNumber, text))
     }
   } catch {
     mupdfOccurrences = []
+  } finally {
+    releaseMuPdf(mupdf, page, doc)
   }
 
   if (mupdfOccurrences.length > 0) return mupdfOccurrences
@@ -1219,9 +1230,12 @@ export async function attemptExperimentalTextEdit(
     })
   }
 
+  let mupdf: MuPdfModule | undefined
+  let doc: MuPdfDocument | undefined
+  let page: MuPdfPDFPage | undefined
   try {
-    const mupdf = await import('mupdf')
-    const doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
+    mupdf = await import('mupdf')
+    doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
     const pdfDoc = doc.asPDF()
     if (!pdfDoc) {
       return operationResult(pdfData, {
@@ -1240,7 +1254,7 @@ export async function attemptExperimentalTextEdit(
       })
     }
 
-    const page = pdfDoc.loadPage(pageNumber - 1) as InstanceType<MuPdfModule['PDFPage']>
+    page = pdfDoc.loadPage(pageNumber - 1) as MuPdfPDFPage
     const hits = page.search(originalText, 100)
     if (hits.length === 0) {
       return operationResult(pdfData, {
@@ -1319,8 +1333,10 @@ export async function attemptExperimentalTextEdit(
       status: 'failed',
       method: operationMethodFor(occurrence),
       verified: false,
-      reason: error instanceof Error ? error.message : 'MuPDF 직접 수정 중 오류가 발생했습니다.',
+      reason: describeMuPdfError(error, 'MuPDF 직접 수정 중 오류가 발생했습니다.'),
     })
+  } finally {
+    releaseMuPdf(mupdf, page, doc)
   }
 }
 
@@ -1344,9 +1360,12 @@ export async function attemptSelectedRectDelete(
     appliedRect: occurrence.rect,
   }
 
+  let mupdf: MuPdfModule | undefined
+  let doc: MuPdfDocument | undefined
+  let page: MuPdfPDFPage | undefined
   try {
-    const mupdf = await import('mupdf')
-    const doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
+    mupdf = await import('mupdf')
+    doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
     const pdfDoc = doc.asPDF()
     if (!pdfDoc || doc.needsPassword()) {
       return operationResult(pdfData, {
@@ -1360,7 +1379,7 @@ export async function attemptSelectedRectDelete(
       })
     }
 
-    const page = pdfDoc.loadPage(pageNumber - 1) as MuPdfPDFPage
+    page = pdfDoc.loadPage(pageNumber - 1) as MuPdfPDFPage
     const rects = occurrence.rects.length > 0 ? occurrence.rects : [occurrence.rect]
     applyRectRedactions(page, rects, options?.redactionOptions)
     return {
@@ -1383,8 +1402,10 @@ export async function attemptSelectedRectDelete(
       status: 'failed',
       method: 'redaction-delete',
       verified: false,
-      reason: error instanceof Error ? error.message : '선택 영역 삭제 중 오류가 발생했습니다.',
+      reason: describeMuPdfError(error, '선택 영역 삭제 중 오류가 발생했습니다.'),
     })
+  } finally {
+    releaseMuPdf(mupdf, page, doc)
   }
 }
 
@@ -1423,9 +1444,12 @@ export async function attemptDirectTextDelete(
     })
   }
 
+  let mupdf: MuPdfModule | undefined
+  let doc: MuPdfDocument | undefined
+  let page: MuPdfPDFPage | undefined
   try {
-    const mupdf = await import('mupdf')
-    const doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
+    mupdf = await import('mupdf')
+    doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
     const pdfDoc = doc.asPDF()
     if (!pdfDoc || doc.needsPassword()) {
       return operationResult(pdfData, {
@@ -1439,7 +1463,7 @@ export async function attemptDirectTextDelete(
       })
     }
 
-    const page = pdfDoc.loadPage(pageNumber - 1) as MuPdfPDFPage
+    page = pdfDoc.loadPage(pageNumber - 1) as MuPdfPDFPage
     const hits = page.search(originalText, 100)
     if (hits.length === 0) {
       return operationResult(pdfData, {
@@ -1543,7 +1567,9 @@ export async function attemptDirectTextDelete(
       status: 'failed',
       method: 'direct-delete',
       verified: false,
-      reason: error instanceof Error ? error.message : '실제 텍스트 삭제 중 오류가 발생했습니다.',
+      reason: describeMuPdfError(error, '실제 텍스트 삭제 중 오류가 발생했습니다.'),
     })
+  } finally {
+    releaseMuPdf(mupdf, page, doc)
   }
 }

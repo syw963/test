@@ -17,6 +17,7 @@ export async function loadPdf(data: ArrayBuffer): Promise<PDFDocumentProxy> {
     disableFontFace: false,
     standardFontDataUrl: '/pdfjs/standard_fonts/',
     useSystemFonts: true,
+    useWorkerFetch: false,
     wasmUrl: '/pdfjs/wasm/',
   }).promise
 }
@@ -24,14 +25,19 @@ export async function loadPdf(data: ArrayBuffer): Promise<PDFDocumentProxy> {
 export async function readPdfFile(file: File): Promise<SourceDocument> {
   const data = await file.arrayBuffer()
   const pdf = await loadPdf(data)
-  return {
-    id: crypto.randomUUID(),
-    fileName: file.name,
-    pageCount: pdf.numPages,
-    size: file.size,
-    data,
-    rangeText: `1-${pdf.numPages}`,
-    rotation: 0,
+  try {
+    const pageCount = pdf.numPages
+    return {
+      id: crypto.randomUUID(),
+      fileName: file.name,
+      pageCount,
+      size: file.size,
+      data,
+      rangeText: `1-${pageCount}`,
+      rotation: 0,
+    }
+  } finally {
+    void pdf.destroy()
   }
 }
 

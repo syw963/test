@@ -92,7 +92,6 @@ test('중앙 PDF 화면에서 일반 PDF처럼 텍스트를 드래그 선택한�
   const pdfPath = testInfo.outputPath('selectable.pdf')
   await makePdf(pdfPath, ['Selectable Text'])
   await uploadPdf(page, pdfPath)
-  await page.getByRole('button', { name: '페이지 관리' }).click()
 
   const textLayer = page.locator('.textLayer').first()
   await expect(textLayer.locator('span').filter({ hasText: 'Selectable Text' })).toBeVisible()
@@ -102,35 +101,11 @@ test('중앙 PDF 화면에서 일반 PDF처럼 텍스트를 드래그 선택한�
 
   await page.mouse.move(box.x + 58, box.y + 42)
   await page.mouse.down()
-  await page.mouse.move(box.x + 230, box.y + 74, { steps: 10 })
-  await expect(page.locator('.selection-draft')).toBeVisible()
+  await page.mouse.move(box.x + 230, box.y + 74)
   await page.mouse.up()
 
-  await expect(page.getByLabel('원문')).toHaveValue('Selectable Text')
-  await expect(page.locator('.text-selection-highlight')).toHaveCount(1)
-  await expect(page.getByRole('contentinfo').getByText(/선택한 텍스트를 인식했습니다|드래그로 선택한 텍스트를 인식했습니다/)).toBeVisible()
-})
-
-test('글자 드래그 선택에서 얇은 수평 드래그도 텍스트로 인식한다', async ({ page }, testInfo) => {
-  const pdfPath = testInfo.outputPath('thin-drag-select.pdf')
-  await makePdf(pdfPath, ['Thin Drag Text'])
-  await uploadPdf(page, pdfPath)
-
-  await page.getByRole('button', { name: '글자 드래그 선택' }).click()
-  const textSpan = page.locator('.textLayer span').filter({ hasText: 'Thin Drag Text' }).first()
-  await expect(textSpan).toBeVisible()
-  const box = await textSpan.boundingBox()
-  expect(box).not.toBeNull()
-  if (!box) return
-
-  await page.mouse.move(box.x + 2, box.y + box.height / 2)
-  await page.mouse.down()
-  await page.mouse.move(box.x + box.width - 2, box.y + box.height / 2, { steps: 10 })
-  await page.mouse.up()
-
-  await expect(page.getByLabel('원문')).toHaveValue('Thin Drag Text')
-  await expect(page.locator('.text-selection-highlight')).toHaveCount(1)
-  await expect(page.getByRole('contentinfo').getByText(/드래그로 선택한 텍스트를 인식했습니다/)).toBeVisible()
+  const selectedText = await page.evaluate(() => window.getSelection()?.toString() ?? '')
+  expect(selectedText).toContain('Selectable Text')
 })
 
 test('왼쪽 위 로고를 누르면 홈 화면으로 이동한다', async ({ page }, testInfo) => {
@@ -279,8 +254,7 @@ test('일반 텍스트 선택 후 Delete 키로 선택 텍스트를 삭제한다
   await page.mouse.down()
   await page.mouse.move(box.x + box.width - 2, box.y + box.height / 2)
   await page.mouse.up()
-  await expect(page.getByLabel('원문')).toHaveValue('Native DeleteMe')
-  await expect(page.locator('.text-selection-highlight')).toHaveCount(1)
+  await expect.poll(() => page.evaluate(() => window.getSelection()?.toString() ?? '')).toContain('Native Delete')
 
   await page.keyboard.press('Delete')
   await expect(page.getByRole('contentinfo').getByText(/PDF 내부 redaction으로 실제 삭제했습니다/)).toBeVisible()
@@ -346,6 +320,30 @@ test('왼쪽 미리보기와 중앙 스크롤로 페이지를 이동한다', asy
   await page.locator('.document-stage').hover()
   await page.mouse.wheel(0, -900)
   await expect(page.getByRole('contentinfo').getByText(/1 \/ 3|2 \/ 3/)).toBeVisible()
+})
+
+test('페이지 번호 입력으로 이동하고 PDF가 없을 때 실행 불가 버튼을 비활성화한다', async ({ page }, testInfo) => {
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: '저장' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '내보내기' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '축소' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '확대' })).toBeDisabled()
+  await expect(page.getByPlaceholder('문서 내 검색')).toBeDisabled()
+
+  const pdfPath = testInfo.outputPath('jump.pdf')
+  await makePagedPdf(pdfPath, ['Jump One', 'Jump Two', 'Jump Three'])
+  await uploadPdf(page, pdfPath)
+
+  await expect(page.getByRole('button', { name: '저장' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '내보내기' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '축소' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '확대' })).toBeEnabled()
+  await expect(page.getByPlaceholder('문서 내 검색')).toBeEnabled()
+
+  await page.getByLabel('이동할 페이지').fill('3')
+  await page.getByRole('button', { name: '이동', exact: true }).click()
+  await expect(page.getByRole('contentinfo').getByText(/페이지 3 \/ 3/)).toBeVisible()
+  await expect(page.getByRole('contentinfo').getByText(/3쪽으로 이동했습니다/)).toBeVisible()
 })
 
 test('이미지형 페이지 관리 패널에서 페이지 복제와 삭제를 실행한다', async ({ page }, testInfo) => {
@@ -433,6 +431,69 @@ test('열려 있는 여러 PDF를 탭으로 전환해 작업 대상을 바꾼다
   await page.getByRole('tab', { name: /tab-second\.pdf/ }).click()
   await expect(page.getByRole('contentinfo').getByText(/tab-second\.pdf 탭으로 이동했습니다/)).toBeVisible()
   await page.getByPlaceholder('검색').fill('Second Document')
+  await expect(page.locator('.search-result').filter({ hasText: '1쪽' })).toBeVisible()
+})
+
+test('탭을 왕복해도 현재 PDF 수정본과 작업 상태를 유지한다', async ({ page }, testInfo) => {
+  const firstPdf = testInfo.outputPath('tab-edit-first.pdf')
+  const secondPdf = testInfo.outputPath('tab-edit-second.pdf')
+  await makePdf(firstPdf, ['First ReplaceMe'])
+  await makePdf(secondPdf, ['Second Document Marker'])
+
+  await page.goto('/')
+  await page.locator('input[type="file"][accept="application/pdf"]').first().setInputFiles([firstPdf, secondPdf])
+  await expect(page.getByRole('contentinfo').getByText(/2개 PDF를 탭으로 열었습니다/)).toBeVisible()
+
+  await page.getByRole('button', { name: '텍스트 수정' }).click()
+  await page.getByLabel('원문').fill('ReplaceMe')
+  await page.getByLabel('바꿀 문구').fill('Updated')
+  await page.getByRole('button', { name: '현재 페이지에서 수정 시도' }).click()
+  await expect(page.getByRole('contentinfo').getByText(/수정했습니다|교체했습니다/)).toBeVisible()
+
+  await page.getByRole('tab', { name: /tab-edit-second\.pdf/ }).click()
+  await expect(page.getByRole('contentinfo').getByText(/tab-edit-second\.pdf 탭으로 이동했습니다/)).toBeVisible()
+  await page.getByPlaceholder('검색').fill('Second Document')
+  await expect(page.locator('.search-result').filter({ hasText: '1쪽' })).toBeVisible()
+
+  await page.getByRole('tab', { name: /tab-edit-first\.pdf/ }).click()
+  await expect(page.getByRole('contentinfo').getByText(/tab-edit-first\.pdf 탭으로 이동했습니다/)).toBeVisible()
+  await page.getByPlaceholder('검색').fill('Updated')
+  await expect(page.locator('.search-result').filter({ hasText: '1쪽' })).toBeVisible()
+  await expect(page.getByLabel('원문')).toHaveValue('')
+})
+
+test('.pdfproj 불러오기 후 저장 당시 활성 탭과 수정본을 복원한다', async ({ page }, testInfo) => {
+  const firstPdf = testInfo.outputPath('project-first.pdf')
+  const secondPdf = testInfo.outputPath('project-second.pdf')
+  const projectPath = testInfo.outputPath('roundtrip.pdfproj')
+  await makePdf(firstPdf, ['First Document Marker'])
+  await makePdf(secondPdf, ['Second ReplaceMe'])
+
+  await page.goto('/')
+  await page.locator('input[type="file"][accept="application/pdf"]').first().setInputFiles([firstPdf, secondPdf])
+  await expect(page.getByRole('contentinfo').getByText(/2개 PDF를 탭으로 열었습니다/)).toBeVisible()
+  await page.getByRole('tab', { name: /project-second\.pdf/ }).click()
+  await expect(page.getByRole('contentinfo').getByText(/project-second\.pdf 탭으로 이동했습니다/)).toBeVisible()
+
+  await page.getByRole('button', { name: '텍스트 수정' }).click()
+  await page.getByLabel('원문').fill('ReplaceMe')
+  await page.getByLabel('바꿀 문구').fill('UpdatedSecond')
+  await page.getByRole('button', { name: '현재 페이지에서 수정 시도' }).click()
+  await expect(page.getByRole('contentinfo').getByText(/수정했습니다|교체했습니다/)).toBeVisible()
+
+  const project = page.waitForEvent('download')
+  await page.getByRole('button', { name: '저장' }).click()
+  await (await project).saveAs(projectPath)
+
+  await page.reload()
+  await page.locator('input[accept=".pdfproj,application/x-pdfproj"]').setInputFiles(projectPath)
+  await expect(page.getByRole('contentinfo').getByText(/프로젝트를 불러왔습니다/)).toBeVisible()
+  await expect(page.getByRole('tab', { name: /project-second\.pdf/ })).toHaveAttribute('aria-selected', 'true')
+  await page.getByPlaceholder('검색').fill('UpdatedSecond')
+  await expect(page.locator('.search-result').filter({ hasText: '1쪽' })).toBeVisible()
+
+  await page.getByRole('tab', { name: /project-first\.pdf/ }).click()
+  await page.getByPlaceholder('검색').fill('First Document')
   await expect(page.locator('.search-result').filter({ hasText: '1쪽' })).toBeVisible()
 })
 

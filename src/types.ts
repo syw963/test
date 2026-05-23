@@ -57,7 +57,7 @@ export interface TextOccurrence {
 
 export interface PageOperation {
   id: string
-  type: 'delete' | 'rotate' | 'extract' | 'merge' | 'reorder'
+  type: 'delete' | 'rotate' | 'extract' | 'merge' | 'reorder' | 'duplicate'
   sourceId: string
   pages: number[]
   rotation?: 0 | 90 | 180 | 270
@@ -85,9 +85,19 @@ export interface ProjectBundle {
   manifest: ProjectManifest
   pdfData: ArrayBuffer
   sourceDocuments: SourceDocument[]
+  activeSourceId?: string | null
+  documentSessions?: Record<string, ProjectDocumentSession>
   editOperations: EditOperation[]
   editSnapshots: Record<string, ArrayBuffer>
   pageOperations: PageOperation[]
+}
+
+export interface ProjectDocumentSession {
+  editOperations: EditOperation[]
+  editSnapshots: Record<string, ArrayBuffer>
+  pageOperations: PageOperation[]
+  currentPage: number
+  extractRange: string
 }
 
 export interface RecentProject {
