@@ -1684,6 +1684,15 @@ function App() {
     setStatus(`${removedOperations.length}개 본문 작업을 되돌렸습니다.`)
   }
 
+  async function exportPdf(): Promise<void> {
+    if (!pdfData) return
+    setStatus('PDF를 압축하는 중입니다…')
+    const { compactPdf } = await import('./lib/textEdit')
+    const compacted = await compactPdf(pdfData)
+    downloadBytes(compacted, activeSource?.fileName ?? `${manifest?.name ?? 'document'}.pdf`)
+    setStatus('PDF를 내보냈습니다.')
+  }
+
   async function exportProject(): Promise<void> {
     if (!manifest || !pdfData) {
       setStatus('저장할 프로젝트가 없습니다.')
@@ -1841,7 +1850,7 @@ function App() {
           </button>
           <button
             type="button"
-            onClick={() => pdfData && downloadBytes(pdfData, activeSource?.fileName ?? `${manifest?.name ?? 'document'}.pdf`)}
+            onClick={() => void exportPdf()}
             disabled={!pdfData}
           >
             <Download aria-hidden="true" />
@@ -2734,7 +2743,9 @@ function PageCanvas({
   const displayViewportScale = 1.35 * zoom
   const renderViewportScale = 1.35 * DEFAULT_RENDER_ZOOM
   const instantScale = zoom / DEFAULT_RENDER_ZOOM
-  const dragModeEnabled = manualOverlayEnabled || textSelectionEnabled
+  // Region drag is the default on the active page; the "글자 드래그 선택" toggle opts into glyph selection.
+  const manualDragMode = active && (manualOverlayEnabled || !textSelectionEnabled)
+  const dragModeEnabled = active && (manualDragMode || textSelectionEnabled)
 
   useEffect(() => {
     docRef.current = doc
@@ -2896,8 +2907,7 @@ function PageCanvas({
               if (!dragModeEnabled || !dragStartRef.current) return
               const rect = pointerToPdfRect(event)
               if (!rect) return
-              if (manualOverlayEnabled) onManualRectChange(pageNumber, rect)
-              else setDraftSelectionRect(normalizeRect(rect))
+              setDraftSelectionRect(normalizeRect(rect))
             }}
             onPointerUp={(event) => {
               if (!dragModeEnabled || !dragStartRef.current) return
@@ -2905,8 +2915,9 @@ function PageCanvas({
               dragStartRef.current = null
               setDraftSelectionRect(null)
               if (rect && Math.abs(rect.width) > 3 && Math.abs(rect.height) > 3) {
-                if (manualOverlayEnabled) onManualRectChange(pageNumber, rect)
-                else onTextRectSelect(pageNumber, normalizeRect(rect))
+                const normalized = normalizeRect(rect)
+                if (manualDragMode) onManualRectChange(pageNumber, normalized)
+                else onTextRectSelect(pageNumber, normalized)
               }
             }}
           >

@@ -766,13 +766,40 @@ function toMuPdfQuad(quad: Quad): MuPdfQuad {
   ]
 }
 
-function saveMuPdfDocument(pdfDoc: InstanceType<MuPdfModule['PDFDocument']>): ArrayBuffer {
-  const saved = pdfDoc.saveToBuffer('garbage=4,compress=yes')
+function saveMuPdfBuffer(pdfDoc: InstanceType<MuPdfModule['PDFDocument']>, options: string): ArrayBuffer {
+  const saved = pdfDoc.saveToBuffer(options)
   try {
     const savedBytes = new Uint8Array(saved.asUint8Array())
     return savedBytes.buffer.slice(savedBytes.byteOffset, savedBytes.byteOffset + savedBytes.byteLength)
   } finally {
     saved.destroy()
+  }
+}
+
+// Editing saves run on every delete/replace. garbage=2 drops the now-unreferenced
+// (redacted) objects so removals stay real, but skips the full-document stream
+// recompression that made each edit scale with page count. Final compaction with
+// garbage=4,compress is deferred to compactPdf() at export time.
+function saveMuPdfDocument(pdfDoc: InstanceType<MuPdfModule['PDFDocument']>): ArrayBuffer {
+  return saveMuPdfBuffer(pdfDoc, 'garbage=2')
+}
+
+// Full compaction (garbage collection + stream recompression) for the final export.
+// Editing keeps the lighter garbage=2 save, so this runs once on download to keep the
+// output file small. Falls back to the input bytes if the document can't be reopened.
+export async function compactPdf(pdfData: ArrayBuffer): Promise<ArrayBuffer> {
+  let mupdf: MuPdfModule | undefined
+  let doc: MuPdfDocument | undefined
+  try {
+    mupdf = await import('mupdf')
+    doc = mupdf.Document.openDocument(pdfData.slice(0), 'application/pdf')
+    const pdfDoc = doc.asPDF()
+    if (!pdfDoc || doc.needsPassword()) return pdfData
+    return saveMuPdfBuffer(pdfDoc, 'garbage=4,compress=yes')
+  } catch {
+    return pdfData
+  } finally {
+    releaseMuPdf(mupdf, doc)
   }
 }
 
