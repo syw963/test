@@ -79,6 +79,7 @@ interface UndoSnapshot {
   id: string
   label: string
   operationId?: string
+  activeSourceId: string | null
   mode: ToolMode
   manifest: ProjectManifest | null
   pdfData: ArrayBuffer | null
@@ -118,6 +119,8 @@ interface PageRenderMetrics {
 const APP_VERSION = '0.1.0'
 const AUTO_SAVE_MAX_SNAPSHOT_COUNT = 5
 const AUTO_SAVE_MAX_SNAPSHOT_BYTES = 80 * 1024 * 1024
+const UNDO_MAX_SNAPSHOT_COUNT = 10
+const UNDO_MAX_SNAPSHOT_BYTES = 350 * 1024 * 1024
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 4
 const ZOOM_STEP_FACTOR = 1.12
@@ -151,6 +154,35 @@ function copyEditSnapshots(snapshots: Record<string, ArrayBuffer>): Record<strin
   return Object.fromEntries(
     Object.entries(snapshots).map(([id, data]) => [id, data.slice(0)]),
   )
+}
+
+function estimateEditSnapshotBytes(snapshots: Record<string, ArrayBuffer>): number {
+  return Object.values(snapshots).reduce((total, snapshot) => total + snapshot.byteLength, 0)
+}
+
+function estimateSourceDocumentBytes(sources: SourceDocument[]): number {
+  return sources.reduce((total, source) => total + source.data.byteLength, 0)
+}
+
+function estimateUndoSnapshotBytes(snapshot: UndoSnapshot): number {
+  return (
+    (snapshot.pdfData?.byteLength ?? 0) +
+    estimateSourceDocumentBytes(snapshot.sourceDocuments) +
+    estimateEditSnapshotBytes(snapshot.editSnapshots)
+  )
+}
+
+function trimUndoSnapshots(snapshots: UndoSnapshot[]): UndoSnapshot[] {
+  const trimmed: UndoSnapshot[] = []
+  let totalBytes = 0
+  for (const snapshot of snapshots) {
+    if (trimmed.length >= UNDO_MAX_SNAPSHOT_COUNT) break
+    const snapshotBytes = estimateUndoSnapshotBytes(snapshot)
+    if (trimmed.length > 0 && totalBytes + snapshotBytes > UNDO_MAX_SNAPSHOT_BYTES) continue
+    trimmed.push(snapshot)
+    totalBytes += snapshotBytes
+  }
+  return trimmed
 }
 
 function toProjectDocumentSession(session: DocumentSessionState): ProjectDocumentSession {
@@ -638,7 +670,7 @@ function App() {
       editOperations: editOperations.map((operation) => ({ ...operation })),
       editSnapshots: copyEditSnapshots(editSnapshots),
       pageOperations: pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
-      undoStack: undoStack.map((snapshot) => ({
+      undoStack: trimUndoSnapshots(undoStack.map((snapshot) => ({
         ...snapshot,
         manifest: snapshot.manifest ? { ...snapshot.manifest } : null,
         pdfData: snapshot.pdfData ? snapshot.pdfData.slice(0) : null,
@@ -646,7 +678,7 @@ function App() {
         editOperations: snapshot.editOperations.map((operation) => ({ ...operation })),
         editSnapshots: copyEditSnapshots(snapshot.editSnapshots),
         pageOperations: snapshot.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
-      })),
+      }))),
       currentPage,
       extractRange,
     }
@@ -693,8 +725,8 @@ function App() {
       updatedAt: new Date().toISOString(),
       pageCount: pdfDoc?.numPages ?? manifest.pageCount,
     }
-    const bundle = createProjectBundle(updatedManifest, true)
     const timer = window.setTimeout(() => {
+      const bundle = createProjectBundle(updatedManifest, true)
       saveProject(bundle)
         .then(() => listRecentProjects())
         .then(setRecentProjects)
@@ -716,7 +748,7 @@ function App() {
     setEditOperations(session?.editOperations.map((operation) => ({ ...operation })) ?? [])
     setEditSnapshots(session ? copyEditSnapshots(session.editSnapshots) : {})
     setPageOperations(session?.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })) ?? [])
-    setUndoStack(session?.undoStack.map((snapshot) => ({
+    setUndoStack(session ? trimUndoSnapshots(session.undoStack.map((snapshot) => ({
       ...snapshot,
       manifest: snapshot.manifest ? { ...snapshot.manifest } : null,
       pdfData: snapshot.pdfData ? snapshot.pdfData.slice(0) : null,
@@ -724,7 +756,7 @@ function App() {
       editOperations: snapshot.editOperations.map((operation) => ({ ...operation })),
       editSnapshots: copyEditSnapshots(snapshot.editSnapshots),
       pageOperations: snapshot.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
-    })) ?? [])
+    }))) : [])
     setCurrentPage(clamp(session?.currentPage ?? 1, 1, Math.max(1, pageCount)))
     setExtractRange(session?.extractRange ?? `1-${pageCount}`)
   }
@@ -774,6 +806,7 @@ function App() {
     return {
       id: crypto.randomUUID(),
       label,
+      activeSourceId: activeSourceIdRef.current,
       mode,
       manifest: manifest ? { ...manifest } : null,
       pdfData: pdfData ? pdfData.slice(0) : null,
@@ -803,7 +836,7 @@ function App() {
 
   const pushUndoSnapshot = useCallback((snapshot: UndoSnapshot | null): void => {
     if (!snapshot) return
-    setUndoStack((stack) => [snapshot, ...stack].slice(0, 30))
+    setUndoStack((stack) => trimUndoSnapshots([snapshot, ...stack]))
   }, [])
 
   const restoreUndoSnapshot = useCallback((snapshot: UndoSnapshot): void => {
@@ -820,9 +853,10 @@ function App() {
     }
     const restoredSources = copySourceDocuments(snapshot.sourceDocuments)
     setSourceDocuments(restoredSources)
-    if (activeSourceIdRef.current && !restoredSources.some((source) => source.id === activeSourceIdRef.current)) {
-      setActiveSource(restoredSources[0]?.id ?? null)
-    }
+    const restoredActiveSourceId = snapshot.activeSourceId && restoredSources.some((source) => source.id === snapshot.activeSourceId)
+      ? snapshot.activeSourceId
+      : restoredSources[0]?.id ?? null
+    setActiveSource(restoredActiveSourceId)
     setEditOperations(snapshot.editOperations.map((operation) => ({ ...operation })))
     setEditSnapshots(copyEditSnapshots(snapshot.editSnapshots))
     setPageOperations(snapshot.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })))

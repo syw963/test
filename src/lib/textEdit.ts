@@ -1024,7 +1024,7 @@ async function loadOverlayFont(pdfDoc: PDFDocument, replacementText: string) {
   pdfDoc.registerFontkit(fontkit)
   const response = await fetch(notoSansKrUrl)
   if (!response.ok) throw new Error('한글 폰트를 불러오지 못했습니다. 잠시 후 다시 시도하세요.')
-  return pdfDoc.embedFont(await response.arrayBuffer(), { subset: false })
+  return pdfDoc.embedFont(await response.arrayBuffer(), { subset: true })
 }
 
 export function createManualOccurrence(
