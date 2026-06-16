@@ -1133,9 +1133,69 @@ function deleteIntersectingPageExtras(page: MuPdfPDFPage, rects: TextOccurrenceR
   }
 }
 
-function applyRectRedactions(page: MuPdfPDFPage, rects: TextOccurrenceRect[], options: RedactionOptions = {}): void {
+// pdf.js normalizes a page's CropBox/MediaBox origin to (0,0), but MuPDF's page space
+// keeps the MediaBox origin. So a rect captured from the pdf.js viewport must be shifted
+// by the MediaBox origin before it is used as a MuPDF redaction rect — otherwise pages
+// with a non-zero MediaBox origin redact content far from the selection.
+function mediaBoxOrigin(page: MuPdfPDFPage): { x: number; y: number } {
+  try {
+    let obj: PdfObject | null = page.getObject()
+    for (let depth = 0; obj && !obj.isNull() && depth < 32; depth += 1) {
+      const media = obj.get('MediaBox')
+      if (media && !media.isNull() && media.isArray()) {
+        const x = media.get(0).asNumber()
+        const y = media.get(1).asNumber()
+        return { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 }
+      }
+      obj = obj.get('Parent')
+    }
+  } catch {
+    // Inheritance walk is best-effort; fall back to no offset.
+  }
+  return { x: 0, y: 0 }
+}
+
+function translateRect(rect: TextOccurrenceRect, offset: { x: number; y: number }): TextOccurrenceRect {
+  return { ...rect, x: rect.x + offset.x, y: rect.y + offset.y }
+}
+
+// TEMP DEBUG: prints the redaction rect(s) actually sent to MuPDF and which text lines
+// sit inside them. Remove once the region-delete misplacement is diagnosed.
+function debugRedaction(
+  page: MuPdfPDFPage,
+  rects: TextOccurrenceRect[],
+  offset: { x: number; y: number },
+  occurrence: TextOccurrence,
+): void {
+  try {
+    const stext = JSON.parse(page.toStructuredText().asJSON()) as {
+      blocks?: { lines?: { text: string; bbox: { x: number; y: number; w: number; h: number } }[] }[]
+    }
+    const lines: { text: string; bbox: { x: number; y: number; w: number; h: number } }[] = []
+    for (const block of stext.blocks ?? []) for (const line of block.lines ?? []) lines.push(line)
+    const mapped = rects.map((rect) => normalizeRect(translateRect(rect, offset)))
+    console.log('[redaction-debug] source=', occurrence.source, 'offset=', offset)
+    mapped.forEach((rect, index) => {
+      const r = { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) }
+      const hit = lines.filter((line) => {
+        const b = line.bbox
+        return rect.x < b.x + b.w && rect.x + rect.width > b.x && rect.y < b.y + b.h && rect.y + rect.height > b.y
+      })
+      console.log(`[redaction-debug] rect#${index}`, r, '-> hits:', hit.map((h) => `${JSON.stringify(h.text).slice(0, 24)}@${Math.round(h.bbox.x)},${Math.round(h.bbox.y)}`))
+    })
+  } catch (error) {
+    console.log('[redaction-debug] failed', error)
+  }
+}
+
+function applyRectRedactions(
+  page: MuPdfPDFPage,
+  rects: TextOccurrenceRect[],
+  options: RedactionOptions = {},
+  originOffset: { x: number; y: number } = { x: 0, y: 0 },
+): void {
   const pageBounds = page.getBounds()
-  const redactionRects = rects.map((rect) => expandRect(rect, options.padding ?? 0, pageBounds))
+  const redactionRects = rects.map((rect) => expandRect(translateRect(rect, originOffset), options.padding ?? 0, pageBounds))
   deleteIntersectingPageExtras(page, redactionRects, options)
 
   for (const rect of redactionRects) {
@@ -1408,7 +1468,11 @@ export async function attemptSelectedRectDelete(
 
     page = pdfDoc.loadPage(pageNumber - 1) as MuPdfPDFPage
     const rects = occurrence.rects.length > 0 ? occurrence.rects : [occurrence.rect]
-    applyRectRedactions(page, rects, options?.redactionOptions)
+    // mupdf-sourced rects are already in MuPDF page space; pdf.js/manual rects need the
+    // MediaBox-origin shift applied.
+    const originOffset = occurrence.source === 'mupdf' ? { x: 0, y: 0 } : mediaBoxOrigin(page)
+    debugRedaction(page, rects, originOffset, occurrence)
+    applyRectRedactions(page, rects, options?.redactionOptions, originOffset)
     return {
       data: saveMuPdfDocument(pdfDoc),
       operation: {
