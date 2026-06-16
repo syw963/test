@@ -1,7 +1,7 @@
 import { degrees, PDFDocument, rgb, StandardFonts } from 'pdf-lib'
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
-import { parsePageRange } from './pageRanges'
+import { parsePageSequence } from './pageRanges'
 import type { MergeRecipe, SourceDocument } from '../types'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -58,7 +58,7 @@ export async function mergeDocuments(recipe: MergeRecipe): Promise<ArrayBuffer> 
     const input = await PDFDocument.load(source.data.slice(0), {
       ignoreEncryption: false,
     })
-    const pages = parsePageRange(source.rangeText, input.getPageCount())
+    const pages = parsePageSequence(source.rangeText, input.getPageCount())
     const copiedPages = await output.copyPages(
       input,
       pages.map((page) => page - 1),
@@ -108,7 +108,7 @@ export async function extractPagesFromData(
   const output = await PDFDocument.create()
   output.setTitle(`${fileName} 추출`)
   output.setAuthor('브라우저 PDF 편집기')
-  const pages = parsePageRange(rangeText, input.getPageCount())
+  const pages = parsePageSequence(rangeText, input.getPageCount())
   const copiedPages = await output.copyPages(
     input,
     pages.map((page) => page - 1),

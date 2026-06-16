@@ -29,7 +29,7 @@ import {
 import { TextLayer } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist'
 import './App.css'
-import { describePages, estimateRecipePageCount, parsePageRange } from './lib/pageRanges'
+import { describePages, estimateRecipePageCount, parsePageRange, parsePageSequence } from './lib/pageRanges'
 import {
   downloadBytes,
   deletePdfPages,
@@ -910,7 +910,7 @@ function App() {
       if (isDeleteKey) {
         const hasBrowserTextSelection = Boolean(browserTextSelectionToOccurrence())
         const hasEditorTextSelection = !isEditableShortcutTarget(event.target) && textSelectionEnabled && Boolean(selectedOccurrence)
-        const hasEditorElementSelection = !isEditableShortcutTarget(event.target) && manualOverlayEnabled && selectedOccurrence?.source === 'manual'
+        const hasEditorElementSelection = !isEditableShortcutTarget(event.target) && !textSelectionEnabled && selectedOccurrence?.source === 'manual'
         if (!hasBrowserTextSelection && !hasEditorTextSelection && !hasEditorElementSelection) return
         event.preventDefault()
         if (hasBrowserTextSelection) void deleteBrowserSelectedText()
@@ -936,7 +936,7 @@ function App() {
 
     window.addEventListener('keydown', handleUndoShortcut)
     return () => window.removeEventListener('keydown', handleUndoShortcut)
-  }, [deleteBrowserSelectedText, manualOverlayEnabled, selectedOccurrence, textSelectionEnabled, undoLastAction])
+  }, [deleteBrowserSelectedText, selectedOccurrence, textSelectionEnabled, undoLastAction])
 
   useEffect(() => {
     if (!textSelectionEnabled) return undefined
@@ -1161,7 +1161,7 @@ function App() {
     if (isProcessing) return
     setIsProcessing(true)
     try {
-      for (const source of sourceDocuments) parsePageRange(source.rangeText, source.pageCount)
+      for (const source of sourceDocuments) parsePageSequence(source.rangeText, source.pageCount)
       const recipe: MergeRecipe = {
         title: mergeTitle,
         author: mergeAuthor,
@@ -1350,7 +1350,7 @@ function App() {
     if (isProcessing) return
     setIsProcessing(true)
     try {
-      const pages = parsePageRange(extractRange, pdfDoc.numPages)
+      const pages = parsePageSequence(extractRange, pdfDoc.numPages)
       const data = await extractPagesFromData(pdfData, manifest?.originalFileName ?? 'document.pdf', extractRange)
       downloadBytes(data, `${manifest?.name ?? 'document'}-${describePages(pages)}.pdf`)
       setPageOperations((operations) => [
