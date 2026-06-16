@@ -1159,32 +1159,37 @@ function translateRect(rect: TextOccurrenceRect, offset: { x: number; y: number 
   return { ...rect, x: rect.x + offset.x, y: rect.y + offset.y }
 }
 
-// TEMP DEBUG: prints the redaction rect(s) actually sent to MuPDF and which text lines
-// sit inside them. Remove once the region-delete misplacement is diagnosed.
-function debugRedaction(
-  page: MuPdfPDFPage,
+// Counts page text items whose center lies OUTSIDE every selection rect (pdf.js viewport
+// space, expanded by a margin). MuPDF's applyRedactions corrupts structurally broken pages —
+// it wipes content far from the selection. If this count drops after a redaction, unrelated
+// content was destroyed and the edit must be rejected to protect the document.
+async function countTextOutsideRects(
+  pdfData: ArrayBuffer,
+  pageNumber: number,
   rects: TextOccurrenceRect[],
-  offset: { x: number; y: number },
-  occurrence: TextOccurrence,
-): void {
+  margin: number,
+): Promise<number> {
+  const doc = await loadPdf(pdfData)
   try {
-    const stext = JSON.parse(page.toStructuredText().asJSON()) as {
-      blocks?: { lines?: { text: string; bbox: { x: number; y: number; w: number; h: number } }[] }[]
-    }
-    const lines: { text: string; bbox: { x: number; y: number; w: number; h: number } }[] = []
-    for (const block of stext.blocks ?? []) for (const line of block.lines ?? []) lines.push(line)
-    const mapped = rects.map((rect) => normalizeRect(translateRect(rect, offset)))
-    console.log('[redaction-debug] source=', occurrence.source, 'offset=', offset)
-    mapped.forEach((rect, index) => {
-      const r = { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) }
-      const hit = lines.filter((line) => {
-        const b = line.bbox
-        return rect.x < b.x + b.w && rect.x + rect.width > b.x && rect.y < b.y + b.h && rect.y + rect.height > b.y
-      })
-      console.log(`[redaction-debug] rect#${index}`, r, '-> hits:', hit.map((h) => `${JSON.stringify(h.text).slice(0, 24)}@${Math.round(h.bbox.x)},${Math.round(h.bbox.y)}`))
+    const page = await doc.getPage(pageNumber)
+    const viewport = page.getViewport({ scale: 1 })
+    const textContent = await page.getTextContent()
+    const expanded = rects.map((rect) => {
+      const n = normalizeRect(rect)
+      return { x: n.x - margin, y: n.y - margin, width: n.width + margin * 2, height: n.height + margin * 2 }
     })
-  } catch (error) {
-    console.log('[redaction-debug] failed', error)
+    let outside = 0
+    for (const item of textContent.items) {
+      if (!('str' in item) || typeof item.str !== 'string' || !item.str.trim()) continue
+      const itemRect = rectForPdfTextItem(item as PdfTextItem, viewport.transform)
+      const cx = itemRect.x + itemRect.width / 2
+      const cy = itemRect.y + itemRect.height / 2
+      const inSelection = expanded.some((r) => cx >= r.x && cx <= r.x + r.width && cy >= r.y && cy <= r.y + r.height)
+      if (!inSelection) outside += 1
+    }
+    return outside
+  } finally {
+    void doc.destroy()
   }
 }
 
@@ -1471,10 +1476,25 @@ export async function attemptSelectedRectDelete(
     // mupdf-sourced rects are already in MuPDF page space; pdf.js/manual rects need the
     // MediaBox-origin shift applied.
     const originOffset = occurrence.source === 'mupdf' ? { x: 0, y: 0 } : mediaBoxOrigin(page)
-    debugRedaction(page, rects, originOffset, occurrence)
     applyRectRedactions(page, rects, options?.redactionOptions, originOffset)
+    const data = saveMuPdfDocument(pdfDoc)
+
+    // Guard against MuPDF corrupting a structurally broken page: if the redaction wiped text
+    // outside the selection, discard the result and keep the original document untouched.
+    const margin = 6
+    const before = await countTextOutsideRects(pdfData, pageNumber, rects, margin)
+    const after = await countTextOutsideRects(data, pageNumber, rects, margin)
+    if (after < before) {
+      return operationResult(pdfData, {
+        ...baseOperation,
+        status: 'failed',
+        method: 'redaction-delete',
+        verified: false,
+        reason: '이 페이지는 PDF 구조가 손상되어 있어, 삭제하면 선택 영역 밖의 내용까지 사라집니다. 원본을 보호하기 위해 삭제를 취소했습니다. (PDF를 복구한 뒤 다시 시도하세요.)',
+      })
+    }
     return {
-      data: saveMuPdfDocument(pdfDoc),
+      data,
       operation: {
         id: crypto.randomUUID(),
         createdAt: new Date().toISOString(),
@@ -1621,20 +1641,37 @@ export async function attemptDirectTextDelete(
 
     try {
       const hit = hits[selectedIndex]
+      const hitRect = occurrenceFromQuads(hit, selectedIndex, pageNumber, originalText).rect
       const redaction = page.createAnnotation('Redact')
       redaction.setRect(rectFromQuads(hit))
       redaction.setQuadPoints(hit.map(toMuPdfQuad))
       redaction.update()
       page.applyRedactions(false, 0, 0, 0)
+      const data = saveMuPdfDocument(pdfDoc)
+
+      // Same corruption guard as attemptSelectedRectDelete: reject if redaction wiped text
+      // outside the matched word on a structurally broken page.
+      const margin = 6
+      const before = await countTextOutsideRects(pdfData, pageNumber, [hitRect], margin)
+      const after = await countTextOutsideRects(data, pageNumber, [hitRect], margin)
+      if (after < before) {
+        return operationResult(pdfData, {
+          ...baseOperation,
+          status: 'failed',
+          method: 'redaction-delete',
+          verified: false,
+          reason: '이 페이지는 PDF 구조가 손상되어 있어, 삭제하면 다른 내용까지 사라집니다. 원본을 보호하기 위해 삭제를 취소했습니다. (PDF를 복구한 뒤 다시 시도하세요.)',
+        })
+      }
 
       return {
-        data: saveMuPdfDocument(pdfDoc),
+        data,
         operation: {
           id: crypto.randomUUID(),
           createdAt: new Date().toISOString(),
           ...baseOperation,
           occurrenceIndex: selectedIndex,
-          appliedRect: occurrence?.rect ?? occurrenceFromQuads(hit, selectedIndex, pageNumber, originalText).rect,
+          appliedRect: occurrence?.rect ?? hitRect,
           status: 'applied',
           method: 'redaction-delete',
           verified: true,
