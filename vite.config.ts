@@ -28,10 +28,16 @@ function pdfJsAssets(): Plugin {
         response: ServerResponse,
         next: () => void,
       ) => {
-        const url = new URL(request.url ?? '/', 'http://local')
-        const requested = decodeURIComponent(url.pathname.replace(/^\/pdfjs\//, ''))
-        const filePath = normalize(join(pdfjsDir, requested))
-        if (relative(pdfjsDir, filePath).startsWith('..') || !existsSync(filePath) || !statSync(filePath).isFile()) {
+        let filePath: string
+        try {
+          const url = new URL(request.url ?? '/', 'http://local')
+          const requested = decodeURIComponent(url.pathname.replace(/^\/pdfjs\//, ''))
+          filePath = normalize(join(pdfjsDir, requested))
+          if (relative(pdfjsDir, filePath).startsWith('..') || !existsSync(filePath) || !statSync(filePath).isFile()) {
+            next()
+            return
+          }
+        } catch {
           next()
           return
         }

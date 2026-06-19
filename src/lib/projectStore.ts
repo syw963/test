@@ -140,41 +140,47 @@ export async function loadProject(id: string): Promise<ProjectBundle | undefined
   if (!stored) return undefined
   if ('pdfData' in stored) return stored as ProjectBundle
 
+  // Bound cache memory to the project being opened so prior projects' whole-PDF
+  // ArrayBuffers are released instead of pinned for the page lifetime.
+  binaryRefCache.clear()
+  binaryHashCache.clear()
+
   const project = stored as StoredProject
-  const current = await db.get('binaries', binaryKey(id, 'current')) as ProjectBinary | undefined
+  const readBinary = async (name: string): Promise<ArrayBuffer | undefined> => {
+    const key = binaryKey(id, name)
+    const binary = await db.get('binaries', key) as ProjectBinary | undefined
+    if (!binary) return undefined
+    binaryRefCache.set(key, binary.data)
+    binaryHashCache.set(key, await hashArrayBuffer(binary.data))
+    return binary.data
+  }
+
+  const current = await readBinary('current')
   if (!current) return undefined
-  binaryRefCache.set(binaryKey(id, 'current'), current.data)
-  binaryHashCache.set(binaryKey(id, 'current'), await hashArrayBuffer(current.data))
-  const sourceDocuments: SourceDocument[] = []
-  for (const source of project.sourceDocuments) {
-    const binary = await db.get('binaries', binaryKey(id, `source-${source.id}`)) as ProjectBinary | undefined
-    if (!binary) continue
-    binaryRefCache.set(binaryKey(id, `source-${source.id}`), binary.data)
-    binaryHashCache.set(binaryKey(id, `source-${source.id}`), await hashArrayBuffer(binary.data))
-    sourceDocuments.push({ ...source, data: binary.data })
-  }
+
+  const sourceResults = await Promise.all(
+    project.sourceDocuments.map(async (source) => {
+      const data = await readBinary(`source-${source.id}`)
+      return data ? { ...source, data } : null
+    }),
+  )
+  const sourceDocuments: SourceDocument[] = sourceResults.filter(
+    (source): source is SourceDocument => source !== null,
+  )
+
   const editSnapshots: Record<string, ArrayBuffer> = {}
-  for (const operationId of project.editSnapshotIds) {
-    const binary = await db.get('binaries', binaryKey(id, `snapshot-${operationId}`)) as ProjectBinary | undefined
-    if (binary) {
-      const key = binaryKey(id, `snapshot-${operationId}`)
-      binaryRefCache.set(key, binary.data)
-      binaryHashCache.set(key, await hashArrayBuffer(binary.data))
-      editSnapshots[operationId] = binary.data
-    }
-  }
+  await Promise.all(project.editSnapshotIds.map(async (operationId) => {
+    const data = await readBinary(`snapshot-${operationId}`)
+    if (data) editSnapshots[operationId] = data
+  }))
+
   const documentSessions: Record<string, ProjectDocumentSession> = {}
-  for (const [sourceId, session] of Object.entries(project.documentSessions ?? {})) {
+  await Promise.all(Object.entries(project.documentSessions ?? {}).map(async ([sourceId, session]) => {
     const sessionSnapshots: Record<string, ArrayBuffer> = {}
-    for (const operationId of session.editSnapshotIds) {
-      const binary = await db.get('binaries', binaryKey(id, `session-${sourceId}-snapshot-${operationId}`)) as ProjectBinary | undefined
-      if (binary) {
-        const key = binaryKey(id, `session-${sourceId}-snapshot-${operationId}`)
-        binaryRefCache.set(key, binary.data)
-        binaryHashCache.set(key, await hashArrayBuffer(binary.data))
-        sessionSnapshots[operationId] = binary.data
-      }
-    }
+    await Promise.all(session.editSnapshotIds.map(async (operationId) => {
+      const data = await readBinary(`session-${sourceId}-snapshot-${operationId}`)
+      if (data) sessionSnapshots[operationId] = data
+    }))
     documentSessions[sourceId] = {
       editOperations: session.editOperations,
       editSnapshots: sessionSnapshots,
@@ -182,10 +188,11 @@ export async function loadProject(id: string): Promise<ProjectBundle | undefined
       currentPage: session.currentPage,
       extractRange: session.extractRange,
     }
-  }
+  }))
+
   return {
     manifest: project.manifest,
-    pdfData: current.data,
+    pdfData: current,
     sourceDocuments,
     activeSourceId: project.activeSourceId,
     documentSessions,
