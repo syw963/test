@@ -36,7 +36,7 @@ export function parsePageRange(input: string, pageCount: number): number[] {
 
 export function describePages(pages: number[]): string {
   if (pages.length === 0) return '0쪽'
-  const sorted = [...pages].sort((a, b) => a - b)
+  const sorted = [...new Set(pages)].sort((a, b) => a - b)
   const ranges: string[] = []
   let start = sorted[0]
   let previous = sorted[0]

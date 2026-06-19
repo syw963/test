@@ -38,6 +38,7 @@ interface RedactionOptions {
   imageMethod?: number
   lineArtMethod?: number
   padding?: number
+  saveMode?: 'compact' | 'fast'
   textMethod?: number
 }
 
@@ -766,8 +767,11 @@ function toMuPdfQuad(quad: Quad): MuPdfQuad {
   ]
 }
 
-function saveMuPdfDocument(pdfDoc: InstanceType<MuPdfModule['PDFDocument']>): ArrayBuffer {
-  const saved = pdfDoc.saveToBuffer('garbage=4,compress=yes')
+function saveMuPdfDocument(
+  pdfDoc: InstanceType<MuPdfModule['PDFDocument']>,
+  mode: RedactionOptions['saveMode'] = 'compact',
+): ArrayBuffer {
+  const saved = pdfDoc.saveToBuffer(mode === 'fast' ? 'garbage=1,compress=no' : 'garbage=4,compress=yes')
   try {
     const savedBytes = new Uint8Array(saved.asUint8Array())
     return savedBytes.buffer.slice(savedBytes.byteOffset, savedBytes.byteOffset + savedBytes.byteLength)
@@ -1383,7 +1387,7 @@ export async function attemptSelectedRectDelete(
     const rects = occurrence.rects.length > 0 ? occurrence.rects : [occurrence.rect]
     applyRectRedactions(page, rects, options?.redactionOptions)
     return {
-      data: saveMuPdfDocument(pdfDoc),
+      data: saveMuPdfDocument(pdfDoc, options?.redactionOptions?.saveMode),
       operation: {
         id: crypto.randomUUID(),
         createdAt: new Date().toISOString(),

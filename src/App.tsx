@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent, RefObject } from 'react'
 import {
   ChevronDown,
@@ -134,6 +134,9 @@ const DEFAULT_OVERLAY_STYLE: OverlayTextStyle = {
   backgroundColor: '#ffffff',
   textColor: '#111111',
 }
+// Stable empty array so memoized PageCanvas instances for non-active pages do not
+// re-render on every parent render from a fresh `[]` literal.
+const EMPTY_OCCURRENCES: TextOccurrence[] = []
 
 function snippetForSearch(value: string, matchStart: number, matchLength: number): string {
   const compact = value.replace(/\s+/g, ' ').trim()
@@ -178,7 +181,7 @@ function trimUndoSnapshots(snapshots: UndoSnapshot[]): UndoSnapshot[] {
   for (const snapshot of snapshots) {
     if (trimmed.length >= UNDO_MAX_SNAPSHOT_COUNT) break
     const snapshotBytes = estimateUndoSnapshotBytes(snapshot)
-    if (trimmed.length > 0 && totalBytes + snapshotBytes > UNDO_MAX_SNAPSHOT_BYTES) continue
+    if (trimmed.length > 0 && totalBytes + snapshotBytes > UNDO_MAX_SNAPSHOT_BYTES) break
     trimmed.push(snapshot)
     totalBytes += snapshotBytes
   }
@@ -400,6 +403,9 @@ function App() {
   const pendingZoomAnchorRef = useRef<ZoomAnchor | null>(null)
   const textDeleteActionRef = useRef<(() => void) | null>(null)
   const elementDeleteActionRef = useRef<(() => void) | null>(null)
+  // Synchronous edit lock: prevents a second edit or a tab switch from racing an
+  // in-flight async edit (state-based isProcessing updates a render too late).
+  const isProcessingRef = useRef(false)
 
   useEffect(() => {
     listRecentProjects().then(setRecentProjects).catch(() => setRecentProjects([]))
@@ -476,7 +482,6 @@ function App() {
   useEffect(() => {
     if (!pdfData) return
     const reloadTarget = pdfReloadTargetRef.current
-    searchTextCacheRef.current.clear()
 
     let cancelled = false
     loadPdf(pdfData)
@@ -518,6 +523,12 @@ function App() {
     }
   }, [pdfData])
 
+  // Invalidate the page-text search cache when the document itself changes so a
+  // stale in-flight search cannot leave another document's snippets behind.
+  useEffect(() => {
+    searchTextCacheRef.current.clear()
+  }, [pdfDoc])
+
   useEffect(() => {
     if (!pdfDoc || !searchText.trim()) {
       const timer = window.setTimeout(() => {
@@ -535,6 +546,7 @@ function App() {
         const results: SearchResult[] = []
         let failedPages = 0
         for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
+          if (cancelled) return
           let pageText = searchTextCacheRef.current.get(pageNumber)
           if (pageText === undefined) {
             try {
@@ -670,13 +682,12 @@ function App() {
       editOperations: editOperations.map((operation) => ({ ...operation })),
       editSnapshots: copyEditSnapshots(editSnapshots),
       pageOperations: pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
+      // Snapshots are immutable once captured, so share their ArrayBuffers across
+      // sessions instead of re-slicing megabytes of PDF on every tab switch.
       undoStack: trimUndoSnapshots(undoStack.map((snapshot) => ({
         ...snapshot,
         manifest: snapshot.manifest ? { ...snapshot.manifest } : null,
-        pdfData: snapshot.pdfData ? snapshot.pdfData.slice(0) : null,
-        sourceDocuments: copySourceDocuments(snapshot.sourceDocuments),
         editOperations: snapshot.editOperations.map((operation) => ({ ...operation })),
-        editSnapshots: copyEditSnapshots(snapshot.editSnapshots),
         pageOperations: snapshot.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
       }))),
       currentPage,
@@ -734,8 +745,11 @@ function App() {
     }, 1500)
 
     return () => window.clearTimeout(timer)
+    // currentPage/extractRange are intentionally excluded: they don't change the
+    // document bytes, so paging or editing the range must not trigger a full re-copy
+    // autosave. They are still persisted on the next byte-affecting change.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- createProjectBundle only reads the state values listed below.
-  }, [activeSourceId, currentPage, editOperations, editSnapshots, extractRange, manifest, pageOperations, pdfData, pdfDoc?.numPages, sourceDocuments])
+  }, [activeSourceId, editOperations, editSnapshots, manifest, pageOperations, pdfData, pdfDoc?.numPages, sourceDocuments])
 
   function stashCurrentDocumentSession(): SourceDocument[] {
     documentSessionsRef.current[currentDocumentSessionKey()] = captureDocumentSession()
@@ -751,10 +765,7 @@ function App() {
     setUndoStack(session ? trimUndoSnapshots(session.undoStack.map((snapshot) => ({
       ...snapshot,
       manifest: snapshot.manifest ? { ...snapshot.manifest } : null,
-      pdfData: snapshot.pdfData ? snapshot.pdfData.slice(0) : null,
-      sourceDocuments: copySourceDocuments(snapshot.sourceDocuments),
       editOperations: snapshot.editOperations.map((operation) => ({ ...operation })),
-      editSnapshots: copyEditSnapshots(snapshot.editSnapshots),
       pageOperations: snapshot.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })),
     }))) : [])
     setCurrentPage(clamp(session?.currentPage ?? 1, 1, Math.max(1, pageCount)))
@@ -857,6 +868,14 @@ function App() {
       ? snapshot.activeSourceId
       : restoredSources[0]?.id ?? null
     setActiveSource(restoredActiveSourceId)
+    // Reconcile per-tab sessions with the restored document set: drop sessions for
+    // tabs that no longer exist and the active tab's pre-undo stash, so a later tab
+    // switch cannot re-apply the state we just undid.
+    const restoredSourceIds = new Set(restoredSources.map((source) => source.id))
+    for (const sessionId of Object.keys(documentSessionsRef.current)) {
+      if (!restoredSourceIds.has(sessionId)) delete documentSessionsRef.current[sessionId]
+    }
+    delete documentSessionsRef.current[currentDocumentSessionKey()]
     setEditOperations(snapshot.editOperations.map((operation) => ({ ...operation })))
     setEditSnapshots(copyEditSnapshots(snapshot.editSnapshots))
     setPageOperations(snapshot.pageOperations.map((operation) => ({ ...operation, pages: [...operation.pages] })))
@@ -880,27 +899,42 @@ function App() {
   }, [restoreUndoSnapshot, undoStack])
 
   const deleteBrowserSelectedText = useCallback(async (): Promise<void> => {
-    if (!pdfData) return
+    if (!pdfData || isProcessingRef.current) return
     const selectedText = browserTextSelectionToOccurrence()
     if (!selectedText) return
+    isProcessingRef.current = true
+    setIsProcessing(true)
     setInspectorTab('text')
     const undoSnapshot = createUndoSnapshot('선택 텍스트 삭제')
-    const { attemptSelectedRectDelete } = await import('./lib/textEdit')
-    const result = await attemptSelectedRectDelete(pdfData, selectedText.pageNumber, selectedText.occurrence)
-    window.getSelection()?.removeAllRanges()
+    try {
+      const { attemptSelectedRectDelete } = await import('./lib/textEdit')
+      const result = await attemptSelectedRectDelete(pdfData, selectedText.pageNumber, selectedText.occurrence, {
+        redactionOptions: {
+          deleteAnnotations: true,
+          deleteLinks: true,
+          imageMethod: 1,
+        },
+      })
+      window.getSelection()?.removeAllRanges()
 
-    if (result.operation.status === 'applied') {
-      pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
-      setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: pdfData.slice(0) }))
-      setEditOperations((operations) => [result.operation, ...operations])
-      replacePdfData(result.data, selectedText.pageNumber)
-      setCurrentPage(selectedText.pageNumber)
-      setScrollRequest((request) => ({ id: (request?.id ?? 0) + 1, page: selectedText.pageNumber }))
-      resetTransientSelection()
-    } else {
-      setEditOperations((operations) => [result.operation, ...operations])
+      if (result.operation.status === 'applied') {
+        pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
+        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: undoSnapshot?.pdfData ?? pdfData.slice(0) }))
+        setEditOperations((operations) => [result.operation, ...operations])
+        replacePdfData(result.data, selectedText.pageNumber)
+        setCurrentPage(selectedText.pageNumber)
+        setScrollRequest((request) => ({ id: (request?.id ?? 0) + 1, page: selectedText.pageNumber }))
+        resetTransientSelection()
+      } else {
+        setEditOperations((operations) => [result.operation, ...operations])
+      }
+      setStatus(result.operation.reason ?? '선택 텍스트 삭제 검사를 완료했습니다.')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '선택 텍스트 삭제 중 오류가 발생했습니다.')
+    } finally {
+      isProcessingRef.current = false
+      setIsProcessing(false)
     }
-    setStatus(result.operation.reason ?? '선택 텍스트 삭제 검사를 완료했습니다.')
   }, [createUndoSnapshot, pdfData, pushUndoSnapshot, resetTransientSelection])
 
   useEffect(() => {
@@ -1064,11 +1098,15 @@ function App() {
   }
 
   function removeSource(id: string): void {
+    if (isProcessingRef.current) return
     const sources = stashCurrentDocumentSession()
     const index = sources.findIndex((source) => source.id === id)
     if (index === -1) return
     const remaining = sources.filter((source) => source.id !== id)
     setSourceDocuments(remaining)
+    // Release the closed tab's stashed session (undo snapshots + edit binaries) so it
+    // is neither retained in memory nor serialized into future autosaves.
+    delete documentSessionsRef.current[id]
 
     // 닫는 탭이 현재 활성 탭인 경우 다른 탭으로 전환
     if (id === activeSourceIdRef.current) {
@@ -1127,6 +1165,10 @@ function App() {
   function switchSourceDocument(sourceId: string): void {
     const source = sourceDocuments.find((document) => document.id === sourceId)
     if (!source || source.id === activeSourceIdRef.current) return
+    if (isProcessingRef.current) {
+      setStatus('처리 중에는 다른 문서로 전환할 수 없습니다. 잠시 후 다시 시도하세요.')
+      return
+    }
     stashCurrentDocumentSession()
     setActiveSource(source.id)
     replacePdfData(source.data.slice(0), 'all', { syncActiveSource: false })
@@ -1158,7 +1200,8 @@ function App() {
       setStatus('병합할 PDF를 추가하세요.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       for (const source of sourceDocuments) parsePageRange(source.rangeText, source.pageCount)
@@ -1201,6 +1244,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '병합에 실패했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1252,7 +1296,8 @@ function App() {
       setStatus('페이지 작업을 할 PDF가 없습니다.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const pages = parsePageRange(extractRange, pdfDoc.numPages)
@@ -1274,6 +1319,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '페이지 회전에 실패했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1283,7 +1329,8 @@ function App() {
       setStatus('페이지 작업을 할 PDF가 없습니다.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const pages = parsePageRange(extractRange, pdfDoc.numPages)
@@ -1306,6 +1353,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '페이지 삭제에 실패했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1315,7 +1363,8 @@ function App() {
       setStatus('페이지 작업을 할 PDF가 없습니다.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const pages = parsePageRange(extractRange, pdfDoc.numPages)
@@ -1337,6 +1386,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '페이지 복제에 실패했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1347,7 +1397,8 @@ function App() {
       setStatus('추출할 현재 작업 PDF가 없습니다.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const pages = parsePageRange(extractRange, pdfDoc.numPages)
@@ -1367,6 +1418,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '범위 추출에 실패했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1385,7 +1437,8 @@ function App() {
       setStatus('원문을 모르면 문서에서 덮어쓸 영역을 드래그로 지정하세요.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const undoSnapshot = createUndoSnapshot('본문 수정')
@@ -1405,7 +1458,7 @@ function App() {
         )
         if (result.operation.status === 'applied') {
           pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
-          setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: pdfData.slice(0) }))
+          setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: undoSnapshot?.pdfData ?? pdfData.slice(0) }))
           setEditOperations((operations) => [result.operation, ...operations])
           replacePdfData(result.data, currentPage)
           setEditOriginal('')
@@ -1455,7 +1508,7 @@ function App() {
       )
       if (result.operation.status === 'applied') {
         pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
-        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: pdfData.slice(0) }))
+        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: undoSnapshot?.pdfData ?? pdfData.slice(0) }))
         setEditOperations((operations) => [result.operation, ...operations])
         replacePdfData(result.data, currentPage)
         setEditOriginal('')
@@ -1473,6 +1526,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '본문 수정 중 오류가 발생했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1486,16 +1540,23 @@ function App() {
       setStatus('삭제할 원문을 입력하거나 문서에서 글자를 드래그로 선택하세요.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const undoSnapshot = createUndoSnapshot('텍스트 삭제')
       const { attemptDirectTextDelete, attemptSelectedRectDelete, listTextOccurrences } = await import('./lib/textEdit')
       if (selectedOccurrence && (selectedOccurrence.source === 'manual' || selectedOccurrence.id.startsWith('selection-') || !editOriginal.trim())) {
-        const result = await attemptSelectedRectDelete(pdfData, currentPage, selectedOccurrence)
+        const result = await attemptSelectedRectDelete(pdfData, currentPage, selectedOccurrence, {
+          redactionOptions: {
+            deleteAnnotations: true,
+            deleteLinks: true,
+            imageMethod: 1,
+          },
+        })
         if (result.operation.status === 'applied') {
           pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
-          setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: pdfData.slice(0) }))
+          setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: undoSnapshot?.pdfData ?? pdfData.slice(0) }))
           setEditOperations((operations) => [result.operation, ...operations])
           replacePdfData(result.data, currentPage)
           setEditOriginal('')
@@ -1539,7 +1600,7 @@ function App() {
       )
       if (result.operation.status === 'applied') {
         pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
-        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: pdfData.slice(0) }))
+        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: undoSnapshot?.pdfData ?? pdfData.slice(0) }))
         setEditOperations((operations) => [result.operation, ...operations])
         replacePdfData(result.data, currentPage)
         setEditOriginal('')
@@ -1557,6 +1618,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '실제 텍스트 삭제 중 오류가 발생했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1574,7 +1636,8 @@ function App() {
       setStatus('삭제할 도형이나 요소 영역을 문서 위에서 드래그하세요.')
       return
     }
-    if (isProcessing) return
+    if (isProcessing || isProcessingRef.current) return
+    isProcessingRef.current = true
     setIsProcessing(true)
     try {
       const undoSnapshot = createUndoSnapshot('도형/요소 삭제')
@@ -1587,12 +1650,13 @@ function App() {
           imageMethod: 1,
           lineArtMethod: 2,
           padding: 1.5,
+          saveMode: 'fast',
         },
         successReason: '선택한 도형/이미지/요소 영역을 PDF 내부 redaction으로 삭제했습니다.',
       })
       if (result.operation.status === 'applied') {
         pushUndoSnapshot(undoSnapshot ? { ...undoSnapshot, operationId: result.operation.id } : null)
-        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: pdfData.slice(0) }))
+        setEditSnapshots((snapshots) => ({ ...snapshots, [result.operation.id]: undoSnapshot?.pdfData ?? pdfData.slice(0) }))
         setEditOperations((operations) => [result.operation, ...operations])
         replacePdfData(result.data, targetOccurrence.pageNumber)
         setCurrentPage(targetOccurrence.pageNumber)
@@ -1609,6 +1673,7 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '도형/이미지/요소 삭제 중 오류가 발생했습니다.')
     } finally {
+      isProcessingRef.current = false
       setIsProcessing(false)
     }
   }
@@ -1622,7 +1687,7 @@ function App() {
     }
   })
 
-  async function handleTextRectSelect(pageNumber: number, rect: TextOccurrenceRect): Promise<void> {
+  const handleTextRectSelect = useCallback(async (pageNumber: number, rect: TextOccurrenceRect): Promise<void> => {
     if (!pdfData) return
     try {
       const { listTextOccurrencesInRect } = await import('./lib/textEdit')
@@ -1648,7 +1713,21 @@ function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '드래그 선택 처리 중 오류가 발생했습니다.')
     }
-  }
+  }, [pdfData, activatePage])
+
+  const handleManualRectChange = useCallback((pageNumber: number, rect: TextOccurrenceRect) => {
+    activatePage(pageNumber, false)
+    setManualOverlayRect(rect)
+    setSelectedOccurrenceId('manual-' + pageNumber)
+  }, [activatePage])
+
+  const handleVisiblePageChange = useCallback((page: number) => {
+    activatePage(page, false)
+  }, [activatePage])
+
+  const handleTextRectSelectDrag = useCallback((pageNumber: number, rect: TextOccurrenceRect) => {
+    void handleTextRectSelect(pageNumber, rect)
+  }, [handleTextRectSelect])
 
   function undoEditOperation(operationId: string): void {
     const operationIndex = editOperations.findIndex((operation) => operation.id === operationId)
@@ -2108,14 +2187,10 @@ function App() {
                   textSelectionEnabled={textSelectionEnabled}
                   zoom={zoom}
                   onStyleSample={handleOverlayStyleSample}
-                  onManualRectChange={(pageNumber, rect) => {
-                    activatePage(pageNumber, false)
-                    setManualOverlayRect(rect)
-                    setSelectedOccurrenceId('manual-' + pageNumber)
-                  }}
+                  onManualRectChange={handleManualRectChange}
                   onSelectOccurrence={setSelectedOccurrenceId}
-                  onTextRectSelect={(pageNumber, rect) => void handleTextRectSelect(pageNumber, rect)}
-                  onVisiblePageChange={(page) => activatePage(page, false)}
+                  onTextRectSelect={handleTextRectSelectDrag}
+                  onVisiblePageChange={handleVisiblePageChange}
                 />
               )}
             </div>
@@ -2548,7 +2623,7 @@ function sampleOverlayStyle(
   }
 }
 
-function PdfCanvas({
+const PdfCanvas = memo(function PdfCanvas({
   currentPage,
   doc,
   documentRenderVersion,
@@ -2568,9 +2643,14 @@ function PdfCanvas({
   onVisiblePageChange,
 }: PdfCanvasProps) {
   const pageRefs = useRef(new Map<number, HTMLDivElement>())
+  const currentPageRef = useRef(currentPage)
   const [pageMetrics, setPageMetrics] = useState<Record<number, PageRenderMetrics>>({})
 
   const defaultMetrics = pageMetrics[currentPage] ?? pageMetrics[1] ?? DEFAULT_PAGE_METRICS
+
+  useEffect(() => {
+    currentPageRef.current = currentPage
+  }, [currentPage])
 
   const handlePageMetricsChange = useCallback((pageNumber: number, metrics: PageRenderMetrics) => {
     setPageMetrics((current) => {
@@ -2601,7 +2681,7 @@ function PdfCanvas({
         .sort((a, b) => b.ratio - a.ratio || a.top - b.top)
 
       const first = visible[0]
-      if (first && first.page !== currentPage) onVisiblePageChange(first.page)
+      if (first && first.page !== currentPageRef.current) onVisiblePageChange(first.page)
     }, {
       root,
       rootMargin: '-12% 0px -62% 0px',
@@ -2610,7 +2690,7 @@ function PdfCanvas({
 
     for (const node of pageRefs.current.values()) observer.observe(node)
     return () => observer.disconnect()
-  }, [currentPage, doc, onVisiblePageChange, scrollRootRef])
+  }, [doc, onVisiblePageChange, scrollRootRef])
 
   if (!doc) {
     return <div className="document-empty">PDF를 열면 여기에 문서가 표시됩니다.</div>
@@ -2633,7 +2713,7 @@ function PdfCanvas({
               active={pageNumber === currentPage}
               doc={doc}
               manualOverlayEnabled={manualOverlayEnabled && pageNumber === currentPage}
-              occurrences={pageNumber === currentPage ? occurrences : []}
+              occurrences={pageNumber === currentPage ? occurrences : EMPTY_OCCURRENCES}
               pageNumber={pageNumber}
               renderVersion={documentRenderVersion + (pageRenderVersions[pageNumber] ?? 0)}
               searchText={searchText}
@@ -2658,7 +2738,7 @@ function PdfCanvas({
       ))}
     </div>
   )
-}
+})
 
 interface PageCanvasProps {
   active: boolean
@@ -2705,7 +2785,7 @@ function PagePlaceholder({
   )
 }
 
-function PageCanvas({
+const PageCanvas = memo(function PageCanvas({
   active,
   doc,
   manualOverlayEnabled,
@@ -2728,6 +2808,9 @@ function PageCanvas({
   const overlayRef = useRef<HTMLDivElement>(null)
   const dragStartRef = useRef<{ x: number; y: number } | null>(null)
   const sampleKeyRef = useRef('')
+  // searchText only feeds a status label; keep it in a ref so typing in the search
+  // box does not re-run the expensive canvas/text-layer render effect every keystroke.
+  const searchTextRef = useRef(searchText)
   const [renderState, setRenderState] = useState('페이지 준비 중')
   const [renderMetrics, setRenderMetrics] = useState({ width: 1, height: 1 })
   const [draftSelectionRect, setDraftSelectionRect] = useState<TextOccurrenceRect | null>(null)
@@ -2739,6 +2822,10 @@ function PageCanvas({
   useEffect(() => {
     docRef.current = doc
   }, [doc])
+
+  useEffect(() => {
+    searchTextRef.current = searchText
+  }, [searchText])
 
   const selectedOccurrence = useMemo(
     () => occurrences.find((occurrence) => occurrence.id === selectedOccurrenceId),
@@ -2829,7 +2916,7 @@ function PageCanvas({
             ? '텍스트 추출 실패: 브라우저 자산 로딩 문제일 수 있음'
             : selectableTextCount === 0
               ? '선택 가능한 텍스트 없음: 이미지형/스캔 PDF일 수 있음'
-              : searchText ? `"${searchText}" 검색어 표시 준비` : '렌더링 완료')
+              : searchTextRef.current ? `"${searchTextRef.current}" 검색어 표시 준비` : '렌더링 완료')
         }
       })
       .catch((error: unknown) => {
@@ -2843,7 +2930,7 @@ function PageCanvas({
       textLayer?.cancel()
       textLayerElement?.replaceChildren()
     }
-  }, [onMetricsChange, pageNumber, renderVersion, searchText])
+  }, [onMetricsChange, pageNumber, renderVersion])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -2948,7 +3035,7 @@ function PageCanvas({
       {active ? <div className="floating-note">{renderState}</div> : null}
     </div>
   )
-}
+})
 
 interface EditorInspectorProps {
   currentPage: number
@@ -3042,13 +3129,6 @@ function EditorInspector({
           onClick={() => onTextSelectionModeChange(!textSelectionEnabled)}
         >
           {textSelectionEnabled ? '글자 드래그 선택 중' : '글자 드래그 선택'}
-        </button>
-        <button
-          type="button"
-          className={manualOverlayEnabled ? 'toggle-button active' : 'toggle-button'}
-          onClick={() => onManualModeChange(!manualOverlayEnabled)}
-        >
-          {manualOverlayEnabled ? '수동 영역 지정 중' : '수동 영역 지정'}
         </button>
         <button
           type="button"

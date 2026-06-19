@@ -64,7 +64,10 @@ export async function mergeDocuments(recipe: MergeRecipe): Promise<ArrayBuffer> 
       pages.map((page) => page - 1),
     )
     for (const copiedPage of copiedPages) {
-      if (source.rotation !== 0) copiedPage.setRotation(degrees(source.rotation))
+      if (source.rotation !== 0) {
+        const base = copiedPage.getRotation().angle
+        copiedPage.setRotation(degrees((base + source.rotation + 360) % 360))
+      }
       output.addPage(copiedPage)
     }
     if (recipe.addSeparatorPages && sourceIndex < recipe.sources.length - 1 && separatorFont) {
@@ -90,13 +93,6 @@ export async function mergeDocuments(recipe: MergeRecipe): Promise<ArrayBuffer> 
   return saved.buffer.slice(saved.byteOffset, saved.byteOffset + saved.byteLength) as ArrayBuffer
 }
 
-export async function extractPages(
-  source: SourceDocument,
-  rangeText: string,
-): Promise<ArrayBuffer> {
-  return extractPagesFromData(source.data, source.fileName, rangeText)
-}
-
 export async function extractPagesFromData(
   data: ArrayBuffer,
   fileName: string,
@@ -107,7 +103,11 @@ export async function extractPagesFromData(
   })
   const output = await PDFDocument.create()
   output.setTitle(`${fileName} 추출`)
-  output.setAuthor('브라우저 PDF 편집기')
+  output.setAuthor(input.getAuthor() ?? '브라우저 PDF 편집기')
+  output.setProducer('브라우저 PDF 편집기')
+  output.setCreator('브라우저 PDF 편집기')
+  output.setCreationDate(input.getCreationDate() ?? new Date())
+  output.setModificationDate(new Date())
   const pages = parsePageRange(rangeText, input.getPageCount())
   const copiedPages = await output.copyPages(
     input,
@@ -179,6 +179,7 @@ export async function deletePdfPages(
   if (new Set(pages).size >= pageCount) throw new Error('모든 페이지를 삭제할 수는 없습니다.')
   const deleteSet = new Set(pages)
   const output = await PDFDocument.create()
+  carryMetadata(input, output)
   const keepPages = Array.from({ length: pageCount }, (_, index) => index + 1)
     .filter((page) => !deleteSet.has(page))
   const copiedPages = await output.copyPages(
@@ -201,16 +202,25 @@ export async function duplicatePdfPages(
   validatePages(pages, pageCount)
   const duplicateSet = new Set(pages)
   const output = await PDFDocument.create()
+  carryMetadata(input, output)
+  const indices: number[] = []
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
-    const [page] = await output.copyPages(input, [pageNumber - 1])
-    output.addPage(page)
-    if (duplicateSet.has(pageNumber)) {
-      const [copy] = await output.copyPages(input, [pageNumber - 1])
-      output.addPage(copy)
-    }
+    indices.push(pageNumber - 1)
+    if (duplicateSet.has(pageNumber)) indices.push(pageNumber - 1)
   }
+  const copiedPages = await output.copyPages(input, indices)
+  copiedPages.forEach((page) => output.addPage(page))
   const saved = await output.save()
   return saved.buffer.slice(saved.byteOffset, saved.byteOffset + saved.byteLength) as ArrayBuffer
+}
+
+function carryMetadata(input: PDFDocument, output: PDFDocument): void {
+  output.setTitle(input.getTitle() ?? '편집된 PDF')
+  output.setAuthor(input.getAuthor() ?? '브라우저 PDF 편집기')
+  output.setProducer('브라우저 PDF 편집기')
+  output.setCreator('브라우저 PDF 편집기')
+  output.setCreationDate(input.getCreationDate() ?? new Date())
+  output.setModificationDate(new Date())
 }
 
 function validatePages(pages: number[], pageCount: number): void {
@@ -232,9 +242,13 @@ export function downloadBytes(
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = fileName
+  // Strip path separators / Windows-reserved chars (filenames may originate from
+  // untrusted .pdfproj manifests) while keeping spaces and non-ASCII names.
+  anchor.download = fileName.replace(/[/\\:*?"<>|]/g, '_').replace(/^\.+/, '').trim() || 'download'
   document.body.append(anchor)
   anchor.click()
   anchor.remove()
-  URL.revokeObjectURL(url)
+  // Defer revocation so the browser has time to start reading the blob before
+  // the URL is invalidated (synchronous revoke can drop large/Firefox downloads).
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
